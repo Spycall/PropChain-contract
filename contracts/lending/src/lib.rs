@@ -11,7 +11,7 @@ use ink::storage::Mapping;
 #[ink::contract]
 mod propchain_lending {
     use super::*;
-    use ink::prelude::string::String;
+    use ink::prelude::{string::String, vec::Vec};
 
     #[derive(Debug, PartialEq, Eq, scale::Encode, scale::Decode)]
     #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
@@ -201,6 +201,22 @@ mod propchain_lending {
         Debug, Clone, PartialEq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
     )]
     #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+    pub struct LoanPortfolio {
+        pub owner: AccountId,
+        pub loan_ids: Vec<u64>,
+        pub total_loans: u32,
+        pub approved_loans: u32,
+        pub pending_loans: u32,
+        pub total_requested: u128,
+        pub total_approved: u128,
+        pub total_collateral: u128,
+        pub average_credit_score: u32,
+    }
+
+    #[derive(
+        Debug, Clone, PartialEq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
+    )]
+    #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
     pub struct YieldPosition {
         pub owner: AccountId,
         pub staked: u128,
@@ -247,6 +263,7 @@ mod propchain_lending {
         margin_positions: Mapping<u64, MarginPosition>,
         position_count: u64,
         loan_applications: Mapping<u64, LoanApplication>,
+        borrower_loans: Mapping<AccountId, Vec<u64>>,
         loan_restructurings: Mapping<u64, LoanRestructuring>,
         loan_count: u64,
         loan_servicers: Mapping<u64, LoanServicer>,
@@ -366,6 +383,7 @@ mod propchain_lending {
                 margin_positions: Mapping::default(),
                 position_count: 0,
                 loan_applications: Mapping::default(),
+                borrower_loans: Mapping::default(),
                 loan_restructurings: Mapping::default(),
                 loan_count: 0,
                 loan_servicers: Mapping::default(),
@@ -565,6 +583,7 @@ mod propchain_lending {
                 status: LoanStatus::Pending,
             };
             self.loan_applications.insert(self.loan_count, &app);
+            self.track_borrower_loan(app.applicant, self.loan_count);
             Ok(self.loan_count)
         }
 
@@ -608,6 +627,7 @@ mod propchain_lending {
                 status: LoanStatus::Pending,
             };
             self.loan_applications.insert(self.loan_count, &app);
+            self.track_borrower_loan(app.applicant, self.loan_count);
             Ok(self.loan_count)
         }
 
@@ -1073,6 +1093,12 @@ mod propchain_lending {
         #[ink(message)]
         pub fn get_admin(&self) -> AccountId {
             self.admin
+        }
+
+        fn track_borrower_loan(&mut self, borrower: AccountId, loan_id: u64) {
+            let mut loan_ids = self.borrower_loans.get(borrower).unwrap_or_default();
+            loan_ids.push(loan_id);
+            self.borrower_loans.insert(borrower, &loan_ids);
         }
     }
 

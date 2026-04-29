@@ -60,7 +60,7 @@ fn test_multiple_loan_records_overflow_check() {
 
     let num_loans: u32 = 150;
     let loan_amount: i128 = 1000;
-    
+
     // Simulate recording multiple high-volume loan issuances
     for _ in 0..num_loans {
         client.update_stats_on_new_loan(&loan_amount);

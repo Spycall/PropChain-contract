@@ -73,14 +73,14 @@ impl ReentrancyGuard {
 ///         if self.balance < amount {
 ///             return Err(Error::InsufficientBalance);
 ///         }
-///         
+///
 ///         // Transfer (external call)
 ///         self.env().transfer(to, amount)?;
-///         
+///
 ///         // Update state after transfer
 ///         self.balance -= amount;
 ///         self.emit_event();
-///         
+///
 ///         Ok(())
 ///     })
 /// }

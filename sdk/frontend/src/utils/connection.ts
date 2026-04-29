@@ -164,12 +164,12 @@ export async function withExponentialBackoff<T>(
       return await operation();
     } catch (error) {
       lastError = error instanceof Error ? error : new Error(String(error));
-      
+
       // Do not retry if we've reached maxRetries
       if (attempt === maxRetries) {
         break;
       }
-      
+
       const delay = baseDelayMs * Math.pow(2, attempt);
       await sleep(delay);
       attempt++;

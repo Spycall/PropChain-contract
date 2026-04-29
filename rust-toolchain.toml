@@ -6,5 +6,3 @@ channel = "stable"
 components = ["rustfmt", "clippy", "rust-src"]
 targets = ["wasm32-unknown-unknown"]
 profile = "default"
-
-

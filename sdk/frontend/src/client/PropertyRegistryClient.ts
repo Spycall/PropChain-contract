@@ -727,7 +727,7 @@ export class PropertyRegistryClient {
                 blockHash
               });
             }
-            
+
             const decodedEvents: ContractEvent[] = decodeTransactionEvents(
               this.abi,
               rawEvents as unknown as Array<{
