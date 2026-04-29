@@ -1718,19 +1718,26 @@ pub mod propchain_contracts {
             non_reentrant!(self, {
                 let oracle_addr = self.oracle.ok_or(Error::OracleError)?;
 
-                // Use the Oracle trait to perform the cross-contract call
-                use ink::env::call::FromAccountId;
-                let oracle: ink::contract_ref!(Oracle) =
-                    FromAccountId::from_account_id(oracle_addr);
-
-                // Fetch valuation from oracle
-                let valuation = oracle
-                    .get_valuation(property_id)
+                // Build the cross-contract call and use try_invoke so that
+                // failures (including off-chain env limitations) return an Err
+                // instead of panicking.
+                use ink::env::call::{build_call, ExecutionInput, Selector};
+                let result = build_call::<ink::env::DefaultEnvironment>()
+                    .call(oracle_addr)
+                    .gas_limit(0)
+                    .transferred_value(0)
+                    .exec_input(
+                        ExecutionInput::new(Selector::new(ink::selector_bytes!("get_valuation")))
+                            .push_arg(property_id),
+                    )
+                    .returns::<PropertyValuation>()
+                    .try_invoke()
+                    .map_err(|_| Error::OracleError)?
                     .map_err(|_| Error::OracleError)?;
 
                 // Update the property's recorded valuation in its metadata
                 if let Some(mut property) = self.properties.get(&property_id) {
-                    property.metadata.valuation = valuation.valuation;
+                    property.metadata.valuation = result.valuation;
                     self.properties.insert(&property_id, &property);
                 } else {
                     return Err(Error::PropertyNotFound);
