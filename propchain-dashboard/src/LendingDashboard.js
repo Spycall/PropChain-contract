@@ -25,7 +25,7 @@ const LendingDashboard = () => {
     }, []);
 
     return (
-        <div className="min-h-screen bg-slate-900 text-white p-8">
+        <div className="bg-slate-950 p-4 text-white md:p-8">
             <h1 className="text-3xl font-bold mb-8 border-b border-slate-700 pb-4 flex items-center gap-3">
                 PropChain Analytics
                 <span className="flex items-center gap-2 text-sm font-normal text-slate-400">
