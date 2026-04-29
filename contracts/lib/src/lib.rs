@@ -1714,6 +1714,7 @@ pub mod propchain_contracts {
         /// Update property valuation using the oracle
         #[ink(message)]
         pub fn update_valuation_from_oracle(&mut self, property_id: u64) -> Result<(), Error> {
+            self.ensure_dependency_available(ExternalDependency::Oracle)?;
             non_reentrant!(self, {
                 let oracle_addr = self.oracle.ok_or(Error::OracleError)?;
 
