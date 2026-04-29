@@ -353,6 +353,58 @@ pub struct PoolLiquidityProvider {
 }
 
 // =========================================================================
+// RISK ASSESSMENT MODEL TYPES (Task #254)
+// =========================================================================
+
+/// Property risk factors for comprehensive risk assessment
+#[derive(
+    Debug, Clone, PartialEq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub struct PropertyRiskFactors {
+    pub property_id: u64,
+    pub property_age_years: u32,
+    pub property_value: u128,
+    pub location_code: String,
+    pub construction_type: String,
+    pub has_security_system: bool,
+    pub has_fire_extinguisher: bool,
+    pub has_alarm_system: bool,
+    pub owner_age_years: u32,
+    pub years_as_owner: u32,
+    pub assessed_at: u64,
+}
+
+/// Comprehensive risk assessment model with detailed scoring
+#[derive(
+    Debug, Clone, PartialEq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub struct PropertyRiskModel {
+    pub risk_id: u64,
+    pub property_id: u64,
+    pub property_factors: PropertyRiskFactors,
+    pub historical_claims_count: u32,
+    pub historical_claims_amount: u128,
+    pub location_risk_score: u32,     // 0-1000
+    pub construction_risk_score: u32, // 0-1000
+    pub age_risk_score: u32,          // 0-1000
+    pub ownership_risk_score: u32,    // 0-1000
+    pub claims_history_score: u32,    // 0-1000
+    pub safety_features_score: u32,   // 0-1000 (higher is safer)
+    pub overall_risk_score: u32,      // 0-1000 (weighted average)
+    pub final_risk_level: RiskLevel,
+    pub premium_multiplier: u32,      // 10000 = 1.0x
+    pub assessed_at: u64,
+    pub valid_until: u64,
+    pub model_version: u32,
+}
+
+// =========================================================================
+// FRAUD DETECTION TYPES (Task #258)
+// =========================================================================
+
+/// Types of fraud indicators detected in claims
 // REINSURANCE DISTRIBUTION TYPES
 // =========================================================================
 
@@ -367,6 +419,18 @@ pub struct PoolLiquidityProvider {
     ink::storage::traits::StorageLayout,
 )]
 #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub enum FraudIndicator {
+    MultipleClaimsShortPeriod,   // Multiple claims within days
+    AnomalousClaimAmount,         // Claim amount far above normal
+    SuspiciousTimingPattern,      // Claims on weekends/holidays
+    ExcessiveCoverageRatio,       // Claim close to max coverage
+    HistoricalFraudPattern,       // Policyholder with history
+    Misrepresentation,            // Inconsistent claim details
+    KnownFraudNetwork,            // Associated with fraudulent accounts
+    DuplicateClaimPatterns,       // Similar to previous fraud claims
+}
+
+/// Fraud risk assessment for a claim
 pub enum ReinsuranceTreatyType {
     /// Quota Share: cede a fixed % of every premium and claim
     QuotaShare,
@@ -381,6 +445,25 @@ pub enum ReinsuranceTreatyType {
     Debug, Clone, PartialEq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
 )]
 #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub struct FraudRiskAssessment {
+    pub assessment_id: u64,
+    pub claim_id: u64,
+    pub policy_id: u64,
+    pub policyholder: AccountId,
+    pub fraud_score: u32,              // 0-1000 (higher = more fraud risk)
+    pub fraud_level: RiskLevel,        // Fraud risk level
+    pub detected_indicators: Vec<FraudIndicator>,
+    pub claim_amount: u128,
+    pub expected_amount_range: (u128, u128), // (min, max) expected
+    pub time_since_last_claim: Option<u64>,  // seconds
+    pub similar_claims_count: u32,     // Similar historical claims
+    pub policyholder_claims_count: u32,
+    pub assessor_notes: String,
+    pub assessment_timestamp: u64,
+    pub requires_manual_review: bool,
+}
+
+/// Historical fraud pattern for detection
 pub struct PremiumCession {
     pub cession_id: u64,
     pub agreement_id: u64,
@@ -395,6 +478,17 @@ pub struct PremiumCession {
     Debug, Clone, PartialEq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
 )]
 #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub struct FraudPattern {
+    pub pattern_id: u64,
+    pub pattern_type: FraudIndicator,
+    pub description: String,
+    pub severity_weight: u32, // Weight in fraud scoring (0-1000)
+    pub triggered_count: u32, // How many times this pattern triggered
+    pub last_triggered: u64,
+    pub is_active: bool,
+}
+
+/// Statistics for fraud detection and prevention
 pub struct LossRecovery {
     pub recovery_id: u64,
     pub agreement_id: u64,
@@ -409,6 +503,14 @@ pub struct LossRecovery {
     Debug, Clone, PartialEq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
 )]
 #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub struct FraudDetectionStats {
+    pub total_assessments: u32,
+    pub high_risk_claims: u32,
+    pub rejected_fraud_claims: u32,
+    pub patterns_detected: u32,
+    pub false_positive_count: u32,
+    pub average_fraud_score: u32,
+    pub last_update: u64,
 pub struct ReinsuranceStats {
     pub agreement_id: u64,
     pub treaty_type: ReinsuranceTreatyType,

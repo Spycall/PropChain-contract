@@ -856,6 +856,327 @@ mod insurance_tests {
     }
 
     // =========================================================================
+    // RISK ASSESSMENT MODEL TESTS (Task #254)
+    // =========================================================================
+
+    #[ink::test]
+    fn test_assess_property_risk_comprehensive_works() {
+        let mut contract = setup();
+        let result = contract.assess_property_risk_comprehensive(
+            1,        // property_id
+            10,       // property_age_years
+            5_000_000_000_000u128, // property_value
+            "premium_safe_zone".into(), // location_code
+            "steel_frame".into(), // construction_type
+            true,     // has_security_system
+            true,     // has_fire_extinguisher
+            true,     // has_alarm_system
+            45,       // owner_age_years
+            15,       // years_as_owner
+        );
+        assert!(result.is_ok());
+        let (risk_id, premium_multiplier) = result.unwrap();
+        assert_eq!(risk_id, 1);
+        assert!(premium_multiplier > 0);
+        assert!(premium_multiplier < 15_000); // Should be low risk multiplier
+    }
+
+    #[ink::test]
+    fn test_property_risk_model_low_risk_property() {
+        let mut contract = setup();
+        // Low risk property
+        let (risk_id, multiplier) = contract
+            .assess_property_risk_comprehensive(
+                1,
+                5,                  // New property
+                5_000_000_000_000u128,
+                "premium_safe_zone".into(),
+                "steel_frame".into(),
+                true,
+                true,
+                true,
+                40,
+                10,
+            )
+            .unwrap();
+
+        let model = contract.get_property_risk_model(risk_id).unwrap();
+        assert!(model.overall_risk_score < 400); // Should be low risk
+        assert_eq!(model.final_risk_level, crate::propchain_insurance::RiskLevel::VeryLow);
+    }
+
+    #[ink::test]
+    fn test_property_risk_model_high_risk_property() {
+        let mut contract = setup();
+        // High risk property
+        let (risk_id, multiplier) = contract
+            .assess_property_risk_comprehensive(
+                2,
+                80,                 // Very old
+                500_000_000_000u128, // Low value
+                "high_risk_zone".into(),
+                "wood_frame".into(),
+                false,
+                false,
+                false,
+                25,
+                1,
+            )
+            .unwrap();
+
+        let model = contract.get_property_risk_model(risk_id).unwrap();
+        assert!(model.overall_risk_score > 600); // Should be high risk
+        assert_eq!(model.final_risk_level, crate::propchain_insurance::RiskLevel::High);
+    }
+
+    #[ink::test]
+    fn test_update_property_risk_assessment() {
+        let mut contract = setup();
+        let (risk_id, _) = contract
+            .assess_property_risk_comprehensive(
+                1,
+                20,
+                3_000_000_000_000u128,
+                "suburban".into(),
+                "masonry_veneer".into(),
+                false,
+                false,
+                false,
+                35,
+                5,
+            )
+            .unwrap();
+
+        let model_before = contract.get_property_risk_model(risk_id).unwrap();
+        let score_before = model_before.overall_risk_score;
+
+        // Now update with safety features added
+        let (new_score, new_multiplier) = contract
+            .update_property_risk_assessment(
+                risk_id,
+                20,
+                true,  // Added security system
+                true,  // Added fire extinguisher
+                true,  // Added alarm system
+            )
+            .unwrap();
+
+        // Score should be lower after adding safety features
+        assert!(new_score < score_before);
+    }
+
+    #[ink::test]
+    fn test_property_risk_assessment_unauthorized() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        let result = contract.assess_property_risk_comprehensive(
+            1, 10, 1_000_000_000_000u128, "suburban".into(), "concrete".into(),
+            true, true, true, 40, 5,
+        );
+        assert_eq!(result, Err(InsuranceError::Unauthorized));
+    }
+
+    // =========================================================================
+    // FRAUD DETECTION TESTS (Task #258)
+    // =========================================================================
+
+    #[ink::test]
+    fn test_assess_claim_fraud_risk_low_risk() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+
+        // Setup pool and policy
+        let pool_id = create_pool(&mut contract);
+        test::set_value_transferred::<DefaultEnvironment>(10_000_000_000_000u128);
+        contract.provide_pool_liquidity(pool_id).unwrap();
+        add_risk_assessment(&mut contract, 1);
+
+        let calc = contract
+            .calculate_premium(1, 500_000_000_000u128, CoverageType::Fire)
+            .unwrap();
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        test::set_value_transferred::<DefaultEnvironment>(calc.annual_premium * 2);
+        let policy_id = contract
+            .create_policy(
+                1,
+                CoverageType::Fire,
+                500_000_000_000u128,
+                pool_id,
+                86_400 * 365,
+                "ipfs://policy".into(),
+            )
+            .unwrap();
+
+        // Submit a normal claim
+        let claim_amount = 100_000_000_000u128;
+        let claim_id = contract
+            .submit_claim(
+                policy_id,
+                claim_amount,
+                "Property damage from fire".into(),
+                "ipfs://evidence".into(),
+            )
+            .unwrap();
+
+        // Assess fraud risk
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        let result = contract.assess_claim_fraud_risk(claim_id, policy_id);
+        assert!(result.is_ok());
+        let (assessment_id, fraud_score, requires_review) = result.unwrap();
+        
+        // Low risk claim should have low fraud score
+        assert!(fraud_score < 450); // Below medium threshold
+    }
+
+    #[ink::test]
+    fn test_assess_claim_fraud_risk_high_risk() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+
+        // Setup pool and policy
+        let pool_id = create_pool(&mut contract);
+        test::set_value_transferred::<DefaultEnvironment>(10_000_000_000_000u128);
+        contract.provide_pool_liquidity(pool_id).unwrap();
+        add_risk_assessment(&mut contract, 1);
+
+        let calc = contract
+            .calculate_premium(1, 1_000_000_000_000u128, CoverageType::Fire)
+            .unwrap();
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        test::set_value_transferred::<DefaultEnvironment>(calc.annual_premium * 2);
+        let policy_id = contract
+            .create_policy(
+                1,
+                CoverageType::Fire,
+                1_000_000_000_000u128,
+                pool_id,
+                86_400 * 365,
+                "ipfs://policy".into(),
+            )
+            .unwrap();
+
+        // Submit suspicious claim (very close to coverage max)
+        let claim_amount = 950_000_000_000u128; // 95% of coverage
+        let claim_id = contract
+            .submit_claim(
+                policy_id,
+                claim_amount,
+                "x".into(), // Very short description
+                "".into(),  // No evidence
+            )
+            .unwrap();
+
+        // Assess fraud risk
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        let result = contract.assess_claim_fraud_risk(claim_id, policy_id);
+        assert!(result.is_ok());
+        let (assessment_id, fraud_score, requires_review) = result.unwrap();
+
+        // High risk claim should have high fraud score
+        assert!(fraud_score > 400); // Above medium threshold
+        assert!(requires_review); // Should require manual review
+    }
+
+    #[ink::test]
+    fn test_get_fraud_assessment() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+
+        // Setup and submit claim
+        let pool_id = create_pool(&mut contract);
+        test::set_value_transferred::<DefaultEnvironment>(10_000_000_000_000u128);
+        contract.provide_pool_liquidity(pool_id).unwrap();
+        add_risk_assessment(&mut contract, 1);
+
+        let calc = contract
+            .calculate_premium(1, 500_000_000_000u128, CoverageType::Fire)
+            .unwrap();
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        test::set_value_transferred::<DefaultEnvironment>(calc.annual_premium * 2);
+        let policy_id = contract
+            .create_policy(
+                1,
+                CoverageType::Fire,
+                500_000_000_000u128,
+                pool_id,
+                86_400 * 365,
+                "ipfs://policy".into(),
+            )
+            .unwrap();
+
+        let claim_id = contract
+            .submit_claim(
+                policy_id,
+                100_000_000_000u128,
+                "Damage claim".into(),
+                "ipfs://evidence".into(),
+            )
+            .unwrap();
+
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        let (assessment_id, _, _) = contract.assess_claim_fraud_risk(claim_id, policy_id).unwrap();
+
+        // Retrieve the assessment
+        let assessment = contract.get_fraud_assessment(assessment_id).unwrap();
+        assert_eq!(assessment.claim_id, claim_id);
+        assert_eq!(assessment.policy_id, policy_id);
+        assert_eq!(assessment.policyholder, accounts.bob);
+    }
+
+    #[ink::test]
+    fn test_get_fraud_detection_stats() {
+        let mut contract = setup();
+        let stats = contract.get_fraud_detection_stats();
+        assert!(stats.is_some());
+        let stats_unwrapped = stats.unwrap();
+        assert_eq!(stats_unwrapped.total_assessments, 0);
+        assert_eq!(stats_unwrapped.high_risk_claims, 0);
+    }
+
+    #[ink::test]
+    fn test_fraud_assessment_unauthorized() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+
+        // Create pool and policy first
+        let pool_id = create_pool(&mut contract);
+        test::set_value_transferred::<DefaultEnvironment>(10_000_000_000_000u128);
+        contract.provide_pool_liquidity(pool_id).unwrap();
+        add_risk_assessment(&mut contract, 1);
+
+        let calc = contract
+            .calculate_premium(1, 500_000_000_000u128, CoverageType::Fire)
+            .unwrap();
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        test::set_value_transferred::<DefaultEnvironment>(calc.annual_premium * 2);
+        let policy_id = contract
+            .create_policy(
+                1,
+                CoverageType::Fire,
+                500_000_000_000u128,
+                pool_id,
+                86_400 * 365,
+                "ipfs://policy".into(),
+            )
+            .unwrap();
+
+        let claim_id = contract
+            .submit_claim(
+                policy_id,
+                100_000_000_000u128,
+                "Damage".into(),
+                "ipfs://evidence".into(),
+            )
+            .unwrap();
+
+        // Bob (not admin or assessor) tries to assess fraud
+        let result = contract.assess_claim_fraud_risk(claim_id, policy_id);
+        assert_eq!(result, Err(InsuranceError::Unauthorized));
     // PARAMETRIC INSURANCE TESTS (Issue #249)
     // =========================================================================
 

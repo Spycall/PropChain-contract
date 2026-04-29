@@ -9,6 +9,12 @@
 
 use ink::storage::Mapping;
 
+// Risk Assessment Model (Task #254)
+mod risk_assessment;
+
+// Fraud Detection System (Task #258)
+mod fraud_detection;
+
 /// Decentralized Property Insurance Platform
 #[ink::contract]
 mod propchain_insurance {
@@ -28,6 +34,11 @@ mod propchain_insurance {
     // Data types extracted to types.rs (Issue #101)
     include!("types.rs");
 
+    // Risk Assessment Model (Task #254)
+    use crate::risk_assessment::risk_model;
+
+    // Fraud Detection System (Task #258)
+    use crate::fraud_detection::fraud_detection;
     // Premium calculation engine
     mod premium_engine;
 
@@ -101,6 +112,21 @@ mod propchain_insurance {
         platform_fee_rate: u32,     // Basis points (e.g. 200 = 2%)
         claim_cooldown_period: u64, // In seconds
         min_pool_capital: u128,
+
+        // =========================================================================
+        // RISK ASSESSMENT MODEL (Task #254)
+        // =========================================================================
+        property_risk_models: Mapping<u64, PropertyRiskModel>,
+        risk_model_count: u64,
+
+        // =========================================================================
+        // FRAUD DETECTION SYSTEM (Task #258)
+        // =========================================================================
+        fraud_assessments: Mapping<u64, FraudRiskAssessment>,
+        fraud_assessment_count: u64,
+        fraud_patterns: Mapping<u64, FraudPattern>,
+        fraud_pattern_count: u64,
+        fraud_detection_stats: Option<FraudDetectionStats>,
 
         // Reentrancy protection
         reentrancy_guard: ReentrancyGuard,
@@ -307,6 +333,71 @@ mod propchain_insurance {
     }
 
     // =========================================================================
+    // RISK ASSESSMENT MODEL EVENTS (Task #254)
+    // =========================================================================
+
+    #[ink(event)]
+    pub struct PropertyRiskModelCreated {
+        #[ink(topic)]
+        risk_id: u64,
+        #[ink(topic)]
+        property_id: u64,
+        overall_risk_score: u32,
+        final_risk_level: RiskLevel,
+        premium_multiplier: u32,
+        timestamp: u64,
+    }
+
+    #[ink(event)]
+    pub struct PropertyRiskModelUpdated {
+        #[ink(topic)]
+        risk_id: u64,
+        #[ink(topic)]
+        property_id: u64,
+        new_risk_score: u32,
+        new_risk_level: RiskLevel,
+        timestamp: u64,
+    }
+
+    // =========================================================================
+    // FRAUD DETECTION EVENTS (Task #258)
+    // =========================================================================
+
+    #[ink(event)]
+    pub struct FraudRiskAssessmentCreated {
+        #[ink(topic)]
+        assessment_id: u64,
+        #[ink(topic)]
+        claim_id: u64,
+        #[ink(topic)]
+        policyholder: AccountId,
+        fraud_score: u32,
+        fraud_level: RiskLevel,
+        requires_manual_review: bool,
+        timestamp: u64,
+    }
+
+    #[ink(event)]
+    pub struct HighFraudRiskDetected {
+        #[ink(topic)]
+        claim_id: u64,
+        #[ink(topic)]
+        policyholder: AccountId,
+        fraud_score: u32,
+        indicator_count: u32,
+        timestamp: u64,
+    }
+
+    #[ink(event)]
+    pub struct FraudPatternDetected {
+        #[ink(topic)]
+        claim_id: u64,
+        indicator_type: String,
+        risk_increase: u32,
+        timestamp: u64,
+    }
+
+    // =========================================================================
     // IMPLEMENTATION
     // =========================================================================
 
@@ -350,6 +441,23 @@ mod propchain_insurance {
                 platform_fee_rate: 200,            // 2%
                 claim_cooldown_period: 2_592_000,  // 30 days in seconds
                 min_pool_capital: 100_000_000_000, // Minimum pool capital
+                // Risk Assessment Model (Task #254)
+                property_risk_models: Mapping::default(),
+                risk_model_count: 0,
+                // Fraud Detection System (Task #258)
+                fraud_assessments: Mapping::default(),
+                fraud_assessment_count: 0,
+                fraud_patterns: Mapping::default(),
+                fraud_pattern_count: 0,
+                fraud_detection_stats: Some(FraudDetectionStats {
+                    total_assessments: 0,
+                    high_risk_claims: 0,
+                    rejected_fraud_claims: 0,
+                    patterns_detected: 0,
+                    false_positive_count: 0,
+                    average_fraud_score: 0,
+                    last_update: 0,
+                }),
                 reentrancy_guard: ReentrancyGuard::new(),
                 // Parametric insurance (Issue #249)
                 parametric_policies: Mapping::default(),
@@ -2066,6 +2174,402 @@ mod propchain_insurance {
         #[ink(message)]
         pub fn get_admin(&self) -> AccountId {
             self.admin
+        }
+
+        // =====================================================================
+        // RISK ASSESSMENT MODEL (Task #254)
+        // =====================================================================
+
+        /// Create a comprehensive property risk model for accurate pricing
+        /// Returns the risk_id and premium multiplier
+        #[ink(message)]
+        pub fn assess_property_risk_comprehensive(
+            &mut self,
+            property_id: u64,
+            property_age_years: u32,
+            property_value: u128,
+            location_code: String,
+            construction_type: String,
+            has_security_system: bool,
+            has_fire_extinguisher: bool,
+            has_alarm_system: bool,
+            owner_age_years: u32,
+            years_as_owner: u32,
+        ) -> Result<(u64, u32), InsuranceError> {
+            self.ensure_admin()?;
+
+            let now = self.env().block_timestamp();
+
+            // Create property risk factors
+            let property_factors = PropertyRiskFactors {
+                property_id,
+                property_age_years,
+                property_value,
+                location_code: location_code.clone(),
+                construction_type: construction_type.clone(),
+                has_security_system,
+                has_fire_extinguisher,
+                has_alarm_system,
+                owner_age_years,
+                years_as_owner,
+                assessed_at: now,
+            };
+
+            // Get existing claims history for this property
+            let claims = self.property_policies.get(&property_id).unwrap_or_default();
+            let mut historical_claims_count = 0u32;
+            let mut historical_claims_amount = 0u128;
+
+            for policy_id in claims.iter() {
+                if let Some(policy) = self.policies.get(policy_id) {
+                    historical_claims_count =
+                        historical_claims_count.saturating_add(policy.claims_count);
+                    historical_claims_amount =
+                        historical_claims_amount.saturating_add(policy.total_claimed);
+                }
+            }
+
+            // Calculate individual risk scores
+            let location_risk_score = risk_model::calculate_location_risk_score(&location_code);
+            let construction_risk_score =
+                risk_model::calculate_construction_risk_score(&construction_type);
+            let age_risk_score = risk_model::calculate_age_risk_score(property_age_years);
+            let ownership_risk_score =
+                risk_model::calculate_ownership_risk_score(owner_age_years, years_as_owner);
+            let claims_history_score = risk_model::calculate_claims_history_score(
+                historical_claims_count,
+                historical_claims_amount,
+            );
+            let safety_features_score = risk_model::calculate_safety_features_score(
+                has_security_system,
+                has_fire_extinguisher,
+                has_alarm_system,
+            );
+
+            // Calculate overall risk score
+            let overall_risk_score = risk_model::calculate_overall_risk_score(
+                location_risk_score,
+                construction_risk_score,
+                age_risk_score,
+                ownership_risk_score,
+                claims_history_score,
+                safety_features_score,
+            );
+
+            // Map to risk level
+            let final_risk_level = risk_model::score_to_risk_level(overall_risk_score);
+
+            // Calculate premium multiplier
+            let premium_multiplier = risk_model::calculate_premium_multiplier(overall_risk_score);
+
+            // Create risk model
+            let risk_id = self.risk_model_count + 1;
+            self.risk_model_count = risk_id;
+
+            let validity_duration = risk_model::get_assessment_validity_seconds();
+            let risk_model_data = PropertyRiskModel {
+                risk_id,
+                property_id,
+                property_factors,
+                historical_claims_count,
+                historical_claims_amount,
+                location_risk_score,
+                construction_risk_score,
+                age_risk_score,
+                ownership_risk_score,
+                claims_history_score,
+                safety_features_score,
+                overall_risk_score,
+                final_risk_level: final_risk_level.clone(),
+                premium_multiplier,
+                assessed_at: now,
+                valid_until: now + validity_duration,
+                model_version: risk_model::get_model_version(),
+            };
+
+            self.property_risk_models.insert(&risk_id, &risk_model_data);
+
+            self.env().emit_event(PropertyRiskModelCreated {
+                risk_id,
+                property_id,
+                overall_risk_score,
+                final_risk_level: final_risk_level.clone(),
+                premium_multiplier,
+                timestamp: now,
+            });
+
+            Ok((risk_id, premium_multiplier))
+        }
+
+        /// Get property risk model details
+        #[ink(message)]
+        pub fn get_property_risk_model(
+            &self,
+            risk_id: u64,
+        ) -> Result<PropertyRiskModel, InsuranceError> {
+            self.property_risk_models
+                .get(&risk_id)
+                .ok_or(InsuranceError::RiskModelGenerationFailed)
+        }
+
+        /// Update risk assessment for a property (reassess based on changes)
+        #[ink(message)]
+        pub fn update_property_risk_assessment(
+            &mut self,
+            risk_id: u64,
+            property_age_years: u32,
+            has_security_system: bool,
+            has_fire_extinguisher: bool,
+            has_alarm_system: bool,
+        ) -> Result<(u32, u32), InsuranceError> {
+            self.ensure_admin()?;
+
+            let mut risk_model = self
+                .property_risk_models
+                .get(&risk_id)
+                .ok_or(InsuranceError::RiskModelGenerationFailed)?;
+
+            let now = self.env().block_timestamp();
+
+            // Recalculate affected scores
+            let age_risk_score = risk_model::calculate_age_risk_score(property_age_years);
+            let safety_features_score = risk_model::calculate_safety_features_score(
+                has_security_system,
+                has_fire_extinguisher,
+                has_alarm_system,
+            );
+
+            // Recalculate overall score with updated values
+            let new_overall_score = risk_model::calculate_overall_risk_score(
+                risk_model.location_risk_score,
+                risk_model.construction_risk_score,
+                age_risk_score,
+                risk_model.ownership_risk_score,
+                risk_model.claims_history_score,
+                safety_features_score,
+            );
+
+            let new_risk_level = risk_model::score_to_risk_level(new_overall_score);
+            let new_premium_multiplier =
+                risk_model::calculate_premium_multiplier(new_overall_score);
+
+            // Update model
+            risk_model.age_risk_score = age_risk_score;
+            risk_model.safety_features_score = safety_features_score;
+            risk_model.overall_risk_score = new_overall_score;
+            risk_model.final_risk_level = new_risk_level.clone();
+            risk_model.premium_multiplier = new_premium_multiplier;
+            risk_model.assessed_at = now;
+
+            self.property_risk_models.insert(&risk_id, &risk_model);
+
+            self.env().emit_event(PropertyRiskModelUpdated {
+                risk_id,
+                property_id: risk_model.property_id,
+                new_risk_score: new_overall_score,
+                new_risk_level: new_risk_level.clone(),
+                timestamp: now,
+            });
+
+            Ok((new_overall_score, new_premium_multiplier))
+        }
+
+        // =====================================================================
+        // FRAUD DETECTION SYSTEM (Task #258)
+        // =====================================================================
+
+        /// Perform comprehensive fraud risk assessment on a claim
+        #[ink(message)]
+        pub fn assess_claim_fraud_risk(
+            &mut self,
+            claim_id: u64,
+            policy_id: u64,
+        ) -> Result<(u64, u32, bool), InsuranceError> {
+            let caller = self.env().caller();
+            if caller != self.admin && !self.authorized_assessors.get(&caller).unwrap_or(false) {
+                return Err(InsuranceError::Unauthorized);
+            }
+
+            let claim = self
+                .claims
+                .get(&claim_id)
+                .ok_or(InsuranceError::ClaimNotFound)?;
+
+            let policy = self
+                .policies
+                .get(&policy_id)
+                .ok_or(InsuranceError::PolicyNotFound)?;
+
+            let now = self.env().block_timestamp();
+
+            // Collect fraud indicators and scores
+            let mut fraud_scores = Vec::new();
+            let mut detected_indicators = Vec::new();
+
+            // 1. Check for multiple claims in short period
+            let policyholder_claims = self
+                .policyholder_policies
+                .get(&claim.claimant)
+                .unwrap_or_default();
+            let time_since_last = if let Some(&last_claim_id) = policyholder_claims.last() {
+                if let Some(last_claim) = self.claims.get(&last_claim_id) {
+                    Some(now.saturating_sub(last_claim.submitted_at))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let (detected, score) = fraud_detection::detect_multiple_claims_short_period(
+                policyholder_claims.len() as u32,
+                time_since_last,
+            );
+            if detected {
+                fraud_scores.push(score);
+                detected_indicators.push(FraudIndicator::MultipleClaimsShortPeriod);
+            }
+
+            // 2. Check for anomalous claim amounts
+            let avg_claim_amount = if policy.claims_count > 0 {
+                policy.total_claimed / (policy.claims_count as u128)
+            } else {
+                claim.claim_amount
+            };
+
+            let (detected, score) = fraud_detection::detect_anomalous_claim_amount(
+                claim.claim_amount,
+                avg_claim_amount,
+                policy.coverage_amount,
+            );
+            if detected {
+                fraud_scores.push(score);
+                detected_indicators.push(FraudIndicator::AnomalousClaimAmount);
+            }
+
+            // 3. Check for suspicious timing
+            let (detected, score) = fraud_detection::detect_suspicious_timing(claim.submitted_at);
+            if detected {
+                fraud_scores.push(score);
+                detected_indicators.push(FraudIndicator::SuspiciousTimingPattern);
+            }
+
+            // 4. Check for excessive coverage ratio
+            let (detected, score) = fraud_detection::detect_excessive_coverage_ratio(
+                claim.claim_amount,
+                policy.coverage_amount,
+            );
+            if detected {
+                fraud_scores.push(score);
+                detected_indicators.push(FraudIndicator::ExcessiveCoverageRatio);
+            }
+
+            // 5. Check for historical fraud patterns
+            let policyholder_rejection_rate = 0u32; // Would be calculated from history
+            let (detected, score) = fraud_detection::detect_historical_fraud_pattern(
+                policyholder_claims.len() as u32,
+                policyholder_rejection_rate,
+            );
+            if detected {
+                fraud_scores.push(score);
+                detected_indicators.push(FraudIndicator::HistoricalFraudPattern);
+            }
+
+            // 6. Check for misrepresentation
+            let (detected, score) = fraud_detection::detect_misrepresentation(
+                claim.description.len() as u32,
+                !claim.evidence_url.is_empty(),
+            );
+            if detected {
+                fraud_scores.push(score);
+                detected_indicators.push(FraudIndicator::Misrepresentation);
+            }
+
+            // Calculate total fraud risk score
+            let fraud_score = fraud_detection::calculate_fraud_risk_score(&fraud_scores);
+            let fraud_level = fraud_detection::score_to_fraud_risk_level(fraud_score);
+            let requires_manual_review = fraud_detection::requires_manual_review(
+                fraud_score,
+                detected_indicators.len() as u32,
+            );
+
+            // Create assessment
+            let assessment_id = self.fraud_assessment_count + 1;
+            self.fraud_assessment_count = assessment_id;
+
+            let assessment = FraudRiskAssessment {
+                assessment_id,
+                claim_id,
+                policy_id,
+                policyholder: claim.claimant,
+                fraud_score,
+                fraud_level: fraud_level.clone(),
+                detected_indicators: detected_indicators.clone(),
+                claim_amount: claim.claim_amount,
+                expected_amount_range: (avg_claim_amount / 2, avg_claim_amount * 2),
+                time_since_last_claim: time_since_last,
+                similar_claims_count: policyholder_claims.len() as u32,
+                policyholder_claims_count: policyholder_claims.len() as u32,
+                assessor_notes: String::new(),
+                assessment_timestamp: now,
+                requires_manual_review,
+            };
+
+            self.fraud_assessments.insert(&assessment_id, &assessment);
+
+            // Emit events based on fraud level
+            self.env().emit_event(FraudRiskAssessmentCreated {
+                assessment_id,
+                claim_id,
+                policyholder: claim.claimant,
+                fraud_score,
+                fraud_level: fraud_level.clone(),
+                requires_manual_review,
+                timestamp: now,
+            });
+
+            if fraud_score > fraud_detection::get_high_fraud_risk_threshold() {
+                self.env().emit_event(HighFraudRiskDetected {
+                    claim_id,
+                    policyholder: claim.claimant,
+                    fraud_score,
+                    indicator_count: detected_indicators.len() as u32,
+                    timestamp: now,
+                });
+            }
+
+            // Update fraud detection stats
+            if let Some(mut stats) = self.fraud_detection_stats.take() {
+                stats.total_assessments = stats.total_assessments.saturating_add(1);
+                if fraud_score > fraud_detection::get_high_fraud_risk_threshold() {
+                    stats.high_risk_claims = stats.high_risk_claims.saturating_add(1);
+                }
+                stats.average_fraud_score = (stats.average_fraud_score
+                    * (stats.total_assessments - 1) as u32
+                    + fraud_score)
+                    / stats.total_assessments as u32;
+                stats.last_update = now;
+                self.fraud_detection_stats = Some(stats);
+            }
+
+            Ok((assessment_id, fraud_score, requires_manual_review))
+        }
+
+        /// Get fraud risk assessment details
+        #[ink(message)]
+        pub fn get_fraud_assessment(
+            &self,
+            assessment_id: u64,
+        ) -> Result<FraudRiskAssessment, InsuranceError> {
+            self.fraud_assessments
+                .get(&assessment_id)
+                .ok_or(InsuranceError::FraudAssessmentNotFound)
+        }
+
+        /// Get fraud detection statistics
+        #[ink(message)]
+        pub fn get_fraud_detection_stats(&self) -> Option<FraudDetectionStats> {
+            self.fraud_detection_stats.clone()
         }
 
         // =====================================================================

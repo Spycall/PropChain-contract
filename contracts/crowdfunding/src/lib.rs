@@ -1426,6 +1426,7 @@ mod tests {
     use super::*;
     use ink::env::{test, DefaultEnvironment};
     use propchain_crowdfunding::{
+        CampaignFilter, CampaignStatus, CrowdfundingError, RealEstateCrowdfunding, RiskRating,
         CampaignAnalytics, CampaignFilter, CampaignStatus, CampaignSummary, CrowdfundingError,
         InvestorDemographics, RiskRating, RealEstateCrowdfunding,
     };

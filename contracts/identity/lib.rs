@@ -224,6 +224,11 @@ pub mod propchain_identity {
     )]
     #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
     pub enum KycTier {
+        Tier0Unverified, // No KYC, basic access only
+        Tier1Basic,      // Basic identity verification
+        Tier2Standard,   // Standard KYC with document verification
+        Tier3Enhanced,   // Enhanced due diligence
+        Tier4Premium,    // Premium verification with full background check
         Tier0_Unverified, // No KYC, basic access only
         Tier1_Basic,      // Basic identity verification
         Tier2_Standard,   // Standard KYC with document verification
@@ -658,7 +663,7 @@ pub mod propchain_identity {
                 did_document,
                 reputation_score: 500, // Start with neutral reputation
                 verification_level: VerificationLevel::None,
-                kyc_tier: KycTier::Tier0_Unverified,
+                kyc_tier: KycTier::Tier0Unverified,
                 trust_score: 50,
                 is_verified: false,
                 verified_at: None,
@@ -1477,7 +1482,7 @@ pub mod propchain_identity {
         fn initialize_kyc_tiers(&mut self) {
             let tiers = [
                 KycTierPrivileges {
-                    tier: KycTier::Tier0_Unverified,
+                    tier: KycTier::Tier0Unverified,
                     max_transaction_value: 1_000_000_000_000_000_000, // 1 token
                     daily_transaction_limit: 5,
                     can_trade: false,
@@ -1486,7 +1491,7 @@ pub mod propchain_identity {
                     description: Self::pad_description("Unverified - Basic browsing only"),
                 },
                 KycTierPrivileges {
-                    tier: KycTier::Tier1_Basic,
+                    tier: KycTier::Tier1Basic,
                     max_transaction_value: 10_000_000_000_000_000_000, // 10 tokens
                     daily_transaction_limit: 10,
                     can_trade: true,
@@ -1495,7 +1500,7 @@ pub mod propchain_identity {
                     description: Self::pad_description("Basic - Limited transactions"),
                 },
                 KycTierPrivileges {
-                    tier: KycTier::Tier2_Standard,
+                    tier: KycTier::Tier2Standard,
                     max_transaction_value: 100_000_000_000_000_000_000, // 100 tokens
                     daily_transaction_limit: 50,
                     can_trade: true,
@@ -1504,7 +1509,7 @@ pub mod propchain_identity {
                     description: Self::pad_description("Standard - Full trading access"),
                 },
                 KycTierPrivileges {
-                    tier: KycTier::Tier3_Enhanced,
+                    tier: KycTier::Tier3Enhanced,
                     max_transaction_value: 1_000_000_000_000_000_000_000, // 1000 tokens
                     daily_transaction_limit: 100,
                     can_trade: true,
@@ -1513,7 +1518,7 @@ pub mod propchain_identity {
                     description: Self::pad_description("Enhanced - High value transactions"),
                 },
                 KycTierPrivileges {
-                    tier: KycTier::Tier4_Premium,
+                    tier: KycTier::Tier4Premium,
                     max_transaction_value: u128::MAX,
                     daily_transaction_limit: u64::MAX,
                     can_trade: true,
@@ -1697,11 +1702,11 @@ pub mod propchain_identity {
 
                     // Map KYC tier to verification level
                     identity.verification_level = match request.requested_tier {
-                        KycTier::Tier0_Unverified => VerificationLevel::None,
-                        KycTier::Tier1_Basic => VerificationLevel::Basic,
-                        KycTier::Tier2_Standard => VerificationLevel::Standard,
-                        KycTier::Tier3_Enhanced => VerificationLevel::Enhanced,
-                        KycTier::Tier4_Premium => VerificationLevel::Premium,
+                        KycTier::Tier0Unverified => VerificationLevel::None,
+                        KycTier::Tier1Basic => VerificationLevel::Basic,
+                        KycTier::Tier2Standard => VerificationLevel::Standard,
+                        KycTier::Tier3Enhanced => VerificationLevel::Enhanced,
+                        KycTier::Tier4Premium => VerificationLevel::Premium,
                     };
 
                     identity.is_verified = true;
@@ -1766,7 +1771,7 @@ pub mod propchain_identity {
             let tier = self
                 .user_kyc_tiers
                 .get(&account)
-                .unwrap_or(KycTier::Tier0_Unverified);
+                .unwrap_or(KycTier::Tier0Unverified);
 
             let privileges = self
                 .kyc_tier_privileges
@@ -1896,11 +1901,11 @@ pub mod propchain_identity {
             let reg = default_registry();
 
             // Check that KYC tiers are initialized
-            let tier0 = reg.get_kyc_tier_privileges(KycTier::Tier0_Unverified);
+            let tier0 = reg.get_kyc_tier_privileges(KycTier::Tier0Unverified);
             assert!(tier0.is_some());
             assert!(!tier0.unwrap().can_trade);
 
-            let tier2 = reg.get_kyc_tier_privileges(KycTier::Tier2_Standard);
+            let tier2 = reg.get_kyc_tier_privileges(KycTier::Tier2Standard);
             assert!(tier2.is_some());
             let tier2 = tier2.unwrap();
             assert!(tier2.can_trade);
@@ -1914,7 +1919,7 @@ pub mod propchain_identity {
             let provider_id = accounts.bob;
 
             let name = [0x50u8; 64];
-            let supported_tiers = vec![KycTier::Tier1_Basic, KycTier::Tier2_Standard];
+            let supported_tiers = vec![KycTier::Tier1Basic, KycTier::Tier2Standard];
 
             reg.register_verification_provider(
                 provider_id,
@@ -1955,13 +1960,14 @@ pub mod propchain_identity {
                 provider_id,
                 [0x51u8; 64],
                 ProviderType::GovernmentId,
-                vec![KycTier::Tier1_Basic, KycTier::Tier2_Standard],
+                vec![KycTier::Tier1Basic, KycTier::Tier2Standard],
             )
             .unwrap();
 
             // Bob requests KYC verification
             ink::env::test::set_caller::<ink::env::DefaultEnvironment>(accounts.bob);
             let request_id = reg
+                .request_kyc_verification(provider_id, KycTier::Tier2Standard, Some([0xAB; 32]))
                 .request_kyc_verification(provider_id, KycTier::Tier2_Standard, Some([0xAB; 32]))
                 .unwrap();
 
@@ -1975,11 +1981,11 @@ pub mod propchain_identity {
             // Check Bob's KYC tier was updated
             let bob_tier = reg.get_user_kyc_tier(accounts.bob);
             assert!(bob_tier.is_some());
-            assert_eq!(bob_tier.unwrap(), KycTier::Tier2_Standard);
+            assert_eq!(bob_tier.unwrap(), KycTier::Tier2Standard);
 
             // Check Bob's identity was updated
             let bob_identity = reg.get_identity(accounts.bob).unwrap();
-            assert_eq!(bob_identity.kyc_tier, KycTier::Tier2_Standard);
+            assert_eq!(bob_identity.kyc_tier, KycTier::Tier2Standard);
             assert_eq!(bob_identity.verification_level, VerificationLevel::Standard);
         }
 
@@ -2005,12 +2011,13 @@ pub mod propchain_identity {
                 accounts.charlie,
                 [0x52u8; 64],
                 ProviderType::FinancialVerification,
-                vec![KycTier::Tier3_Enhanced],
+                vec![KycTier::Tier3Enhanced],
             )
             .unwrap();
 
             ink::env::test::set_caller::<ink::env::DefaultEnvironment>(accounts.bob);
             let request_id = reg
+                .request_kyc_verification(accounts.charlie, KycTier::Tier3Enhanced, None)
                 .request_kyc_verification(accounts.charlie, KycTier::Tier3_Enhanced, None)
                 .unwrap();
 
