@@ -54,6 +54,16 @@ mod propchain_insurance {
         reinsurance_agreements: Mapping<u64, ReinsuranceAgreement>,
         reinsurance_count: u64,
 
+        // Reinsurance distribution ledger
+        premium_cessions: Mapping<u64, PremiumCession>,
+        cession_count: u64,
+        loss_recoveries: Mapping<u64, LossRecovery>,
+        loss_recovery_count: u64,
+        // agreement_id -> list of cession IDs
+        agreement_cessions: Mapping<u64, Vec<u64>>,
+        // agreement_id -> list of recovery IDs
+        agreement_recoveries: Mapping<u64, Vec<u64>>,
+
         // Insurance Tokens (secondary market)
         insurance_tokens: Mapping<u64, InsuranceToken>,
         token_count: u64,
@@ -87,13 +97,16 @@ mod propchain_insurance {
         // Reentrancy protection
         reentrancy_guard: ReentrancyGuard,
 
-        // ── External insurance providers (Issue #250) ─────────────────────────
-        external_providers: Mapping<u64, ExternalProvider>,
-        provider_count: u64,
-        coverage_requests: Mapping<u64, ExternalCoverageRequest>,
-        coverage_request_count: u64,
-        /// policy_id → list of coverage request IDs
-        policy_coverage_requests: Mapping<u64, Vec<u64>>,
+        // ── Parametric insurance (Issue #249) ────────────────────────────────
+        parametric_policies: Mapping<u64, ParametricPolicy>,
+        parametric_policy_count: u64,
+        /// property_id → list of parametric policy IDs
+        property_parametric_policies: Mapping<u64, Vec<u64>>,
+        /// holder → list of parametric policy IDs
+        holder_parametric_policies: Mapping<AccountId, Vec<u64>>,
+        /// oracle data points submitted
+        oracle_data: Mapping<u64, OracleDataPoint>,
+        oracle_data_count: u64,
     }
 
     // =========================================================================
@@ -188,6 +201,36 @@ mod propchain_insurance {
     }
 
     #[ink(event)]
+    pub struct PremiumCeded {
+        #[ink(topic)]
+        agreement_id: u64,
+        #[ink(topic)]
+        policy_id: u64,
+        cession_id: u64,
+        ceded_amount: u128,
+        timestamp: u64,
+    }
+
+    #[ink(event)]
+    pub struct LossRecovered {
+        #[ink(topic)]
+        agreement_id: u64,
+        #[ink(topic)]
+        claim_id: u64,
+        recovery_id: u64,
+        recovered_amount: u128,
+        timestamp: u64,
+    }
+
+    #[ink(event)]
+    pub struct ReinsuranceAgreementDeactivated {
+        #[ink(topic)]
+        agreement_id: u64,
+        deactivated_by: AccountId,
+        timestamp: u64,
+    }
+
+    #[ink(event)]
     pub struct InsuranceTokenMinted {
         #[ink(topic)]
         token_id: u64,
@@ -218,34 +261,40 @@ mod propchain_insurance {
         timestamp: u64,
     }
 
-    // ── External provider events (Issue #250) ─────────────────────────────────
+    // ── Parametric insurance events (Issue #249) ──────────────────────────────
 
     #[ink(event)]
-    pub struct ProviderRegistered {
-        #[ink(topic)]
-        provider_id: u64,
-        name: String,
-        timestamp: u64,
-    }
-
-    #[ink(event)]
-    pub struct CoverageRequested {
-        #[ink(topic)]
-        request_id: u64,
-        #[ink(topic)]
-        provider_id: u64,
+    pub struct ParametricPolicyCreated {
         #[ink(topic)]
         policy_id: u64,
+        #[ink(topic)]
+        policyholder: AccountId,
+        #[ink(topic)]
+        property_id: u64,
+        metric: String,
+        trigger_threshold: i128,
         coverage_amount: u128,
+    }
+
+    #[ink(event)]
+    pub struct ParametricPolicyTriggered {
+        #[ink(topic)]
+        policy_id: u64,
+        #[ink(topic)]
+        policyholder: AccountId,
+        oracle_value: i128,
+        payout_amount: u128,
         timestamp: u64,
     }
 
     #[ink(event)]
-    pub struct CoverageResponseRecorded {
+    pub struct OracleDataSubmitted {
         #[ink(topic)]
-        request_id: u64,
-        status: CoverageRequestStatus,
-        provider_quote: u128,
+        data_id: u64,
+        #[ink(topic)]
+        property_id: u64,
+        metric: String,
+        value: i128,
         timestamp: u64,
     }
 
@@ -270,6 +319,12 @@ mod propchain_insurance {
                 risk_assessments: Mapping::default(),
                 reinsurance_agreements: Mapping::default(),
                 reinsurance_count: 0,
+                premium_cessions: Mapping::default(),
+                cession_count: 0,
+                loss_recoveries: Mapping::default(),
+                loss_recovery_count: 0,
+                agreement_cessions: Mapping::default(),
+                agreement_recoveries: Mapping::default(),
                 insurance_tokens: Mapping::default(),
                 token_count: 0,
                 token_listings: Vec::new(),
@@ -285,12 +340,13 @@ mod propchain_insurance {
                 claim_cooldown_period: 2_592_000,  // 30 days in seconds
                 min_pool_capital: 100_000_000_000, // Minimum pool capital
                 reentrancy_guard: ReentrancyGuard::new(),
-                // External providers (Issue #250)
-                external_providers: Mapping::default(),
-                provider_count: 0,
-                coverage_requests: Mapping::default(),
-                coverage_request_count: 0,
-                policy_coverage_requests: Mapping::default(),
+                // Parametric insurance (Issue #249)
+                parametric_policies: Mapping::default(),
+                parametric_policy_count: 0,
+                property_parametric_policies: Mapping::default(),
+                holder_parametric_policies: Mapping::default(),
+                oracle_data: Mapping::default(),
+                oracle_data_count: 0,
             }
         }
 
@@ -825,11 +881,262 @@ mod propchain_insurance {
                 is_active: true,
                 total_ceded_premiums: 0,
                 total_recoveries: 0,
+                treaty_type: ReinsuranceTreatyType::ExcessOfLoss,
+                cession_count: 0,
+                recovery_count: 0,
             };
 
             self.reinsurance_agreements
                 .insert(&agreement_id, &agreement);
             Ok(agreement_id)
+        }
+
+        /// Register a reinsurance agreement with an explicit treaty type (admin only)
+        #[ink(message)]
+        pub fn register_reinsurance_with_type(
+            &mut self,
+            reinsurer: AccountId,
+            treaty_type: ReinsuranceTreatyType,
+            coverage_limit: u128,
+            retention_limit: u128,
+            premium_ceded_rate: u32,
+            coverage_types: Vec<CoverageType>,
+            duration_seconds: u64,
+        ) -> Result<u64, InsuranceError> {
+            self.ensure_admin()?;
+
+            let now = self.env().block_timestamp();
+            let agreement_id = self.reinsurance_count + 1;
+            self.reinsurance_count = agreement_id;
+
+            let agreement = ReinsuranceAgreement {
+                agreement_id,
+                reinsurer,
+                coverage_limit,
+                retention_limit,
+                premium_ceded_rate,
+                coverage_types,
+                start_time: now,
+                end_time: now.saturating_add(duration_seconds),
+                is_active: true,
+                total_ceded_premiums: 0,
+                total_recoveries: 0,
+                treaty_type,
+                cession_count: 0,
+                recovery_count: 0,
+            };
+
+            self.reinsurance_agreements
+                .insert(&agreement_id, &agreement);
+            Ok(agreement_id)
+        }
+
+        /// Deactivate a reinsurance agreement (admin only)
+        #[ink(message)]
+        pub fn deactivate_reinsurance(&mut self, agreement_id: u64) -> Result<(), InsuranceError> {
+            self.ensure_admin()?;
+            let mut agreement = self
+                .reinsurance_agreements
+                .get(&agreement_id)
+                .ok_or(InsuranceError::ReinsuranceAgreementNotFound)?;
+
+            agreement.is_active = false;
+            self.reinsurance_agreements
+                .insert(&agreement_id, &agreement);
+
+            self.env().emit_event(ReinsuranceAgreementDeactivated {
+                agreement_id,
+                deactivated_by: self.env().caller(),
+                timestamp: self.env().block_timestamp(),
+            });
+            Ok(())
+        }
+
+        /// Manually cede a premium amount to a specific reinsurance agreement (admin only).
+        /// Useful for proportional (quota share / surplus) treaties where cession is
+        /// tracked separately from automatic excess-of-loss recovery.
+        #[ink(message)]
+        pub fn cede_premium(
+            &mut self,
+            agreement_id: u64,
+            policy_id: u64,
+            gross_premium: u128,
+        ) -> Result<u64, InsuranceError> {
+            self.ensure_admin()?;
+
+            let mut agreement = self
+                .reinsurance_agreements
+                .get(&agreement_id)
+                .ok_or(InsuranceError::ReinsuranceAgreementNotFound)?;
+
+            if !agreement.is_active {
+                return Err(InsuranceError::ReinsuranceAgreementInactive);
+            }
+            let now = self.env().block_timestamp();
+            if now > agreement.end_time {
+                return Err(InsuranceError::ReinsuranceAgreementExpired);
+            }
+
+            // Ceded amount depends on treaty type
+            let ceded_amount = match agreement.treaty_type {
+                ReinsuranceTreatyType::QuotaShare => {
+                    // Fixed % of every premium
+                    gross_premium.saturating_mul(agreement.premium_ceded_rate as u128) / 10_000
+                }
+                ReinsuranceTreatyType::Surplus => {
+                    // Cede the portion above the retention limit
+                    if gross_premium > agreement.retention_limit {
+                        gross_premium
+                            .saturating_sub(agreement.retention_limit)
+                            .min(agreement.coverage_limit)
+                    } else {
+                        0
+                    }
+                }
+                ReinsuranceTreatyType::ExcessOfLoss => {
+                    // Premium cession for XL is typically a flat rate
+                    gross_premium.saturating_mul(agreement.premium_ceded_rate as u128) / 10_000
+                }
+            };
+
+            if ceded_amount == 0 {
+                return Err(InsuranceError::InvalidParameters);
+            }
+
+            let cession_id = self.cession_count + 1;
+            self.cession_count = cession_id;
+
+            let cession = PremiumCession {
+                cession_id,
+                agreement_id,
+                policy_id,
+                gross_premium,
+                ceded_premium: ceded_amount,
+                ceded_at: now,
+            };
+            self.premium_cessions.insert(&cession_id, &cession);
+
+            // Update agreement totals
+            agreement.total_ceded_premiums =
+                agreement.total_ceded_premiums.saturating_add(ceded_amount);
+            agreement.cession_count += 1;
+            self.reinsurance_agreements
+                .insert(&agreement_id, &agreement);
+
+            // Index cession under agreement
+            let mut cessions = self
+                .agreement_cessions
+                .get(&agreement_id)
+                .unwrap_or_default();
+            cessions.push(cession_id);
+            self.agreement_cessions.insert(&agreement_id, &cessions);
+
+            self.env().emit_event(PremiumCeded {
+                agreement_id,
+                policy_id,
+                cession_id,
+                ceded_amount,
+                timestamp: now,
+            });
+
+            Ok(cession_id)
+        }
+
+        /// Record a loss recovery from a reinsurer for an approved claim (admin only).
+        /// Call this after the reinsurer has settled their share of a large claim.
+        #[ink(message)]
+        pub fn record_loss_recovery(
+            &mut self,
+            agreement_id: u64,
+            claim_id: u64,
+            gross_loss: u128,
+        ) -> Result<u64, InsuranceError> {
+            self.ensure_admin()?;
+
+            let mut agreement = self
+                .reinsurance_agreements
+                .get(&agreement_id)
+                .ok_or(InsuranceError::ReinsuranceAgreementNotFound)?;
+
+            if !agreement.is_active {
+                return Err(InsuranceError::ReinsuranceAgreementInactive);
+            }
+
+            // Verify the claim exists
+            self.claims
+                .get(&claim_id)
+                .ok_or(InsuranceError::ClaimNotFound)?;
+
+            let now = self.env().block_timestamp();
+
+            let recovered_amount = match agreement.treaty_type {
+                ReinsuranceTreatyType::ExcessOfLoss => {
+                    // Recover the portion above retention, capped at coverage limit
+                    if gross_loss > agreement.retention_limit {
+                        gross_loss
+                            .saturating_sub(agreement.retention_limit)
+                            .min(agreement.coverage_limit)
+                    } else {
+                        0
+                    }
+                }
+                ReinsuranceTreatyType::QuotaShare => {
+                    // Reinsurer pays their quota share of the loss
+                    gross_loss.saturating_mul(agreement.premium_ceded_rate as u128) / 10_000
+                }
+                ReinsuranceTreatyType::Surplus => {
+                    // Recover the surplus portion
+                    if gross_loss > agreement.retention_limit {
+                        gross_loss
+                            .saturating_sub(agreement.retention_limit)
+                            .min(agreement.coverage_limit)
+                    } else {
+                        0
+                    }
+                }
+            };
+
+            if recovered_amount == 0 {
+                return Err(InsuranceError::InvalidParameters);
+            }
+
+            let recovery_id = self.loss_recovery_count + 1;
+            self.loss_recovery_count = recovery_id;
+
+            let recovery = LossRecovery {
+                recovery_id,
+                agreement_id,
+                claim_id,
+                gross_loss,
+                recovered_amount,
+                recovered_at: now,
+            };
+            self.loss_recoveries.insert(&recovery_id, &recovery);
+
+            // Update agreement totals
+            agreement.total_recoveries =
+                agreement.total_recoveries.saturating_add(recovered_amount);
+            agreement.recovery_count += 1;
+            self.reinsurance_agreements
+                .insert(&agreement_id, &agreement);
+
+            // Index recovery under agreement
+            let mut recoveries = self
+                .agreement_recoveries
+                .get(&agreement_id)
+                .unwrap_or_default();
+            recoveries.push(recovery_id);
+            self.agreement_recoveries.insert(&agreement_id, &recoveries);
+
+            self.env().emit_event(LossRecovered {
+                agreement_id,
+                claim_id,
+                recovery_id,
+                recovered_amount,
+                timestamp: now,
+            });
+
+            Ok(recovery_id)
         }
 
         // =====================================================================
@@ -1002,227 +1309,287 @@ mod propchain_insurance {
         }
 
         // =====================================================================
-        // EXTERNAL INSURANCE PROVIDERS (Issue #250)
+        // PARAMETRIC INSURANCE (Issue #249)
         // =====================================================================
 
-        /// Register an external insurance provider (admin only).
+        /// Create a parametric insurance policy.
         ///
-        /// Stores the provider's name, API endpoint, and supported coverage
-        /// types on-chain so indexers and front-ends can discover them.
-        #[ink(message)]
-        pub fn register_external_provider(
+        /// The caller pays the premium upfront. When an authorized oracle later
+        /// submits a data point for `property_id` / `metric` that satisfies the
+        /// trigger condition, the full `coverage_amount` is paid out automatically
+        /// from the backing risk pool — no manual claims assessment required.
+        #[ink(message, payable)]
+        pub fn create_parametric_policy(
             &mut self,
-            name: String,
-            api_endpoint: String,
-            supported_coverage_types: Vec<CoverageType>,
-        ) -> Result<u64, InsuranceError> {
-            self.ensure_admin()?;
-
-            let provider_id = self.provider_count + 1;
-            self.provider_count = provider_id;
-
-            let provider = ExternalProvider {
-                provider_id,
-                name: name.clone(),
-                api_endpoint,
-                supported_coverage_types,
-                is_active: true,
-                registered_at: self.env().block_timestamp(),
-            };
-            self.external_providers.insert(&provider_id, &provider);
-
-            self.env().emit_event(ProviderRegistered {
-                provider_id,
-                name,
-                timestamp: self.env().block_timestamp(),
-            });
-
-            Ok(provider_id)
-        }
-
-        /// Deactivate an external provider (admin only).
-        #[ink(message)]
-        pub fn deactivate_external_provider(
-            &mut self,
-            provider_id: u64,
-        ) -> Result<(), InsuranceError> {
-            self.ensure_admin()?;
-            let mut provider = self
-                .external_providers
-                .get(&provider_id)
-                .ok_or(InsuranceError::ProviderNotFound)?;
-            provider.is_active = false;
-            self.external_providers.insert(&provider_id, &provider);
-            Ok(())
-        }
-
-        /// Request hybrid coverage from an external provider for an existing policy.
-        ///
-        /// Records the request on-chain. The actual API call happens off-chain
-        /// (by an indexer or relayer); the provider's response is then submitted
-        /// back via `record_coverage_response`.
-        #[ink(message)]
-        pub fn request_external_coverage(
-            &mut self,
-            policy_id: u64,
-            provider_id: u64,
+            property_id: u64,
+            metric: String,
+            trigger_threshold: i128,
+            comparison: TriggerComparison,
             coverage_amount: u128,
+            pool_id: u64,
+            duration_seconds: u64,
         ) -> Result<u64, InsuranceError> {
             let caller = self.env().caller();
-
-            let policy = self
-                .policies
-                .get(&policy_id)
-                .ok_or(InsuranceError::PolicyNotFound)?;
-            if policy.policyholder != caller {
-                return Err(InsuranceError::Unauthorized);
-            }
-            if policy.status != PolicyStatus::Active {
-                return Err(InsuranceError::PolicyInactive);
-            }
-
-            let provider = self
-                .external_providers
-                .get(&provider_id)
-                .ok_or(InsuranceError::ProviderNotFound)?;
-            if !provider.is_active {
-                return Err(InsuranceError::ProviderInactive);
-            }
-            if !provider.supported_coverage_types.contains(&policy.coverage_type) {
-                return Err(InsuranceError::UnsupportedCoverageType);
-            }
-
-            let request_id = self.coverage_request_count + 1;
-            self.coverage_request_count = request_id;
-
+            let paid = self.env().transferred_value();
             let now = self.env().block_timestamp();
-            let request = ExternalCoverageRequest {
-                request_id,
-                provider_id,
+
+            if paid == 0 {
+                return Err(InsuranceError::InsufficientPremium);
+            }
+
+            // Validate pool has enough capital
+            let mut pool = self
+                .pools
+                .get(&pool_id)
+                .ok_or(InsuranceError::PoolNotFound)?;
+            if !pool.is_active {
+                return Err(InsuranceError::PoolNotFound);
+            }
+            let max_exposure = pool
+                .available_capital
+                .saturating_mul(pool.max_coverage_ratio as u128)
+                / 10_000;
+            if coverage_amount > max_exposure {
+                return Err(InsuranceError::InsufficientPoolFunds);
+            }
+
+            // Credit premium to pool
+            let fee = paid.saturating_mul(self.platform_fee_rate as u128) / 10_000;
+            let pool_share = paid.saturating_sub(fee);
+            pool.total_premiums_collected += pool_share;
+            pool.available_capital += pool_share;
+            pool.active_policies += 1;
+            self.pools.insert(&pool_id, &pool);
+
+            let policy_id = self.parametric_policy_count + 1;
+            self.parametric_policy_count = policy_id;
+
+            let policy = ParametricPolicy {
                 policy_id,
-                requester: caller,
-                coverage_type: policy.coverage_type,
+                property_id,
+                policyholder: caller,
+                metric: metric.clone(),
+                trigger_threshold,
+                comparison,
                 coverage_amount,
-                status: CoverageRequestStatus::Pending,
-                requested_at: now,
-                provider_quote: 0,
-                provider_reference: String::new(),
-                responded_at: None,
+                premium_amount: paid,
+                pool_id,
+                start_time: now,
+                end_time: now.saturating_add(duration_seconds),
+                status: ParametricPolicyStatus::Active,
             };
-            self.coverage_requests.insert(&request_id, &request);
 
-            let mut req_list = self
-                .policy_coverage_requests
-                .get(&policy_id)
+            self.parametric_policies.insert(&policy_id, &policy);
+
+            let mut prop_list = self
+                .property_parametric_policies
+                .get(&property_id)
                 .unwrap_or_default();
-            req_list.push(request_id);
-            self.policy_coverage_requests.insert(&policy_id, &req_list);
+            prop_list.push(policy_id);
+            self.property_parametric_policies
+                .insert(&property_id, &prop_list);
 
-            self.env().emit_event(CoverageRequested {
-                request_id,
-                provider_id,
+            let mut holder_list = self
+                .holder_parametric_policies
+                .get(&caller)
+                .unwrap_or_default();
+            holder_list.push(policy_id);
+            self.holder_parametric_policies.insert(&caller, &holder_list);
+
+            self.env().emit_event(ParametricPolicyCreated {
                 policy_id,
+                policyholder: caller,
+                property_id,
+                metric,
+                trigger_threshold,
                 coverage_amount,
-                timestamp: now,
             });
 
-            Ok(request_id)
+            Ok(policy_id)
         }
 
-        /// Record the external provider's response to a coverage request.
+        /// Submit an oracle data point for a property metric.
         ///
-        /// Only authorized oracles or the admin may call this (acting as the
-        /// trusted relayer that bridges the off-chain API response on-chain).
+        /// Only authorized oracles (or the admin) may call this. After recording
+        /// the data point, all active parametric policies for the property whose
+        /// trigger condition is satisfied are paid out automatically.
         #[ink(message)]
-        pub fn record_coverage_response(
+        pub fn submit_oracle_data(
             &mut self,
-            request_id: u64,
-            confirmed: bool,
-            provider_quote: u128,
-            provider_reference: String,
-        ) -> Result<(), InsuranceError> {
+            property_id: u64,
+            metric: String,
+            value: i128,
+        ) -> Result<u64, InsuranceError> {
             let caller = self.env().caller();
             if caller != self.admin && !self.authorized_oracles.get(&caller).unwrap_or(false) {
                 return Err(InsuranceError::Unauthorized);
             }
 
-            let mut request = self
-                .coverage_requests
-                .get(&request_id)
-                .ok_or(InsuranceError::CoverageRequestNotFound)?;
+            let now = self.env().block_timestamp();
+            let data_id = self.oracle_data_count + 1;
+            self.oracle_data_count = data_id;
 
-            if request.status != CoverageRequestStatus::Pending {
-                return Err(InsuranceError::CoverageRequestNotPending);
+            let data_point = OracleDataPoint {
+                data_id,
+                property_id,
+                metric: metric.clone(),
+                value,
+                submitted_by: caller,
+                submitted_at: now,
+            };
+            self.oracle_data.insert(&data_id, &data_point);
+
+            self.env().emit_event(OracleDataSubmitted {
+                data_id,
+                property_id,
+                metric: metric.clone(),
+                value,
+                timestamp: now,
+            });
+
+            // Evaluate all active parametric policies for this property + metric
+            let policy_ids = self
+                .property_parametric_policies
+                .get(&property_id)
+                .unwrap_or_default();
+
+            for pid in policy_ids {
+                if let Some(policy) = self.parametric_policies.get(&pid) {
+                    if policy.status != ParametricPolicyStatus::Active {
+                        continue;
+                    }
+                    if now > policy.end_time {
+                        continue;
+                    }
+                    if policy.metric != metric {
+                        continue;
+                    }
+                    let triggered = match policy.comparison {
+                        TriggerComparison::GreaterThanOrEqual => value >= policy.trigger_threshold,
+                        TriggerComparison::LessThanOrEqual => value <= policy.trigger_threshold,
+                    };
+                    if triggered {
+                        // Ignore individual payout errors so other policies still process
+                        let _ = self.execute_parametric_payout(pid, value, now);
+                    }
+                }
             }
 
-            let now = self.env().block_timestamp();
-            request.status = if confirmed {
-                CoverageRequestStatus::Confirmed
-            } else {
-                CoverageRequestStatus::Declined
-            };
-            request.provider_quote = provider_quote;
-            request.provider_reference = provider_reference;
-            request.responded_at = Some(now);
-            self.coverage_requests.insert(&request_id, &request);
+            Ok(data_id)
+        }
 
-            self.env().emit_event(CoverageResponseRecorded {
-                request_id,
-                status: request.status,
-                provider_quote,
+        /// Cancel an active parametric policy (policyholder or admin).
+        #[ink(message)]
+        pub fn cancel_parametric_policy(&mut self, policy_id: u64) -> Result<(), InsuranceError> {
+            let caller = self.env().caller();
+            let mut policy = self
+                .parametric_policies
+                .get(&policy_id)
+                .ok_or(InsuranceError::ParametricPolicyNotFound)?;
+
+            if caller != policy.policyholder && caller != self.admin {
+                return Err(InsuranceError::Unauthorized);
+            }
+            if policy.status != ParametricPolicyStatus::Active {
+                return Err(InsuranceError::ParametricPolicyInactive);
+            }
+
+            policy.status = ParametricPolicyStatus::Cancelled;
+            self.parametric_policies.insert(&policy_id, &policy);
+
+            if let Some(mut pool) = self.pools.get(&policy.pool_id) {
+                if pool.active_policies > 0 {
+                    pool.active_policies -= 1;
+                }
+                self.pools.insert(&policy.pool_id, &pool);
+            }
+
+            Ok(())
+        }
+
+        // ── Parametric queries ────────────────────────────────────────────────
+
+        /// Get a parametric policy by ID.
+        #[ink(message)]
+        pub fn get_parametric_policy(&self, policy_id: u64) -> Option<ParametricPolicy> {
+            self.parametric_policies.get(&policy_id)
+        }
+
+        /// Get all parametric policy IDs for a property.
+        #[ink(message)]
+        pub fn get_property_parametric_policies(&self, property_id: u64) -> Vec<u64> {
+            self.property_parametric_policies
+                .get(&property_id)
+                .unwrap_or_default()
+        }
+
+        /// Get all parametric policy IDs for a policyholder.
+        #[ink(message)]
+        pub fn get_holder_parametric_policies(&self, holder: AccountId) -> Vec<u64> {
+            self.holder_parametric_policies
+                .get(&holder)
+                .unwrap_or_default()
+        }
+
+        /// Get an oracle data point by ID.
+        #[ink(message)]
+        pub fn get_oracle_data(&self, data_id: u64) -> Option<OracleDataPoint> {
+            self.oracle_data.get(&data_id)
+        }
+
+        /// Get total parametric policy count.
+        #[ink(message)]
+        pub fn get_parametric_policy_count(&self) -> u64 {
+            self.parametric_policy_count
+        }
+
+        // ── Internal parametric helper ────────────────────────────────────────
+
+        fn execute_parametric_payout(
+            &mut self,
+            policy_id: u64,
+            oracle_value: i128,
+            now: u64,
+        ) -> Result<(), InsuranceError> {
+            let mut policy = self
+                .parametric_policies
+                .get(&policy_id)
+                .ok_or(InsuranceError::ParametricPolicyNotFound)?;
+
+            if policy.status != ParametricPolicyStatus::Active {
+                return Err(InsuranceError::ParametricPolicyAlreadyTriggered);
+            }
+
+            let mut pool = self
+                .pools
+                .get(&policy.pool_id)
+                .ok_or(InsuranceError::PoolNotFound)?;
+
+            if pool.available_capital < policy.coverage_amount {
+                return Err(InsuranceError::InsufficientPoolFunds);
+            }
+
+            pool.available_capital = pool
+                .available_capital
+                .saturating_sub(policy.coverage_amount);
+            pool.total_claims_paid += policy.coverage_amount;
+            if pool.active_policies > 0 {
+                pool.active_policies -= 1;
+            }
+            self.pools.insert(&policy.pool_id, &pool);
+
+            policy.status = ParametricPolicyStatus::Triggered;
+            self.parametric_policies.insert(&policy_id, &policy);
+
+            self.env().emit_event(ParametricPolicyTriggered {
+                policy_id,
+                policyholder: policy.policyholder,
+                oracle_value,
+                payout_amount: policy.coverage_amount,
                 timestamp: now,
             });
 
             Ok(())
-        }
-
-        /// Cancel a pending coverage request (requester or admin).
-        #[ink(message)]
-        pub fn cancel_coverage_request(&mut self, request_id: u64) -> Result<(), InsuranceError> {
-            let caller = self.env().caller();
-            let mut request = self
-                .coverage_requests
-                .get(&request_id)
-                .ok_or(InsuranceError::CoverageRequestNotFound)?;
-
-            if caller != request.requester && caller != self.admin {
-                return Err(InsuranceError::Unauthorized);
-            }
-            if request.status != CoverageRequestStatus::Pending {
-                return Err(InsuranceError::CoverageRequestNotPending);
-            }
-
-            request.status = CoverageRequestStatus::Cancelled;
-            self.coverage_requests.insert(&request_id, &request);
-            Ok(())
-        }
-
-        // ── External provider queries ─────────────────────────────────────────
-
-        /// Get an external provider by ID.
-        #[ink(message)]
-        pub fn get_external_provider(&self, provider_id: u64) -> Option<ExternalProvider> {
-            self.external_providers.get(&provider_id)
-        }
-
-        /// Get a coverage request by ID.
-        #[ink(message)]
-        pub fn get_coverage_request(&self, request_id: u64) -> Option<ExternalCoverageRequest> {
-            self.coverage_requests.get(&request_id)
-        }
-
-        /// Get all coverage request IDs for a policy.
-        #[ink(message)]
-        pub fn get_policy_coverage_requests(&self, policy_id: u64) -> Vec<u64> {
-            self.policy_coverage_requests
-                .get(&policy_id)
-                .unwrap_or_default()
-        }
-
-        /// Get total provider count.
-        #[ink(message)]
-        pub fn get_provider_count(&self) -> u64 {
-            self.provider_count
         }
 
         // =====================================================================
@@ -1332,6 +1699,57 @@ mod propchain_insurance {
         #[ink(message)]
         pub fn get_reinsurance_agreement(&self, agreement_id: u64) -> Option<ReinsuranceAgreement> {
             self.reinsurance_agreements.get(&agreement_id)
+        }
+
+        /// Get a premium cession record
+        #[ink(message)]
+        pub fn get_premium_cession(&self, cession_id: u64) -> Option<PremiumCession> {
+            self.premium_cessions.get(&cession_id)
+        }
+
+        /// Get a loss recovery record
+        #[ink(message)]
+        pub fn get_loss_recovery(&self, recovery_id: u64) -> Option<LossRecovery> {
+            self.loss_recoveries.get(&recovery_id)
+        }
+
+        /// Get all cession IDs for a reinsurance agreement
+        #[ink(message)]
+        pub fn get_agreement_cessions(&self, agreement_id: u64) -> Vec<u64> {
+            self.agreement_cessions
+                .get(&agreement_id)
+                .unwrap_or_default()
+        }
+
+        /// Get all recovery IDs for a reinsurance agreement
+        #[ink(message)]
+        pub fn get_agreement_recoveries(&self, agreement_id: u64) -> Vec<u64> {
+            self.agreement_recoveries
+                .get(&agreement_id)
+                .unwrap_or_default()
+        }
+
+        /// Get aggregated reinsurance statistics for an agreement
+        #[ink(message)]
+        pub fn get_reinsurance_stats(&self, agreement_id: u64) -> Option<ReinsuranceStats> {
+            let agreement = self.reinsurance_agreements.get(&agreement_id)?;
+            let net_recovery = (agreement.total_recoveries as i128)
+                .saturating_sub(agreement.total_ceded_premiums as i128);
+            Some(ReinsuranceStats {
+                agreement_id,
+                treaty_type: agreement.treaty_type,
+                total_ceded_premiums: agreement.total_ceded_premiums,
+                total_recoveries: agreement.total_recoveries,
+                cession_count: agreement.cession_count,
+                recovery_count: agreement.recovery_count,
+                net_recovery,
+            })
+        }
+
+        /// Get total number of reinsurance agreements
+        #[ink(message)]
+        pub fn get_reinsurance_count(&self) -> u64 {
+            self.reinsurance_count
         }
 
         /// Get underwriting criteria for a pool
@@ -1524,17 +1942,65 @@ mod propchain_insurance {
                         continue;
                     }
 
-                    let recovery = amount.saturating_sub(agreement.retention_limit);
-                    let capped_recovery = recovery.min(agreement.coverage_limit);
+                    let recovery = match agreement.treaty_type {
+                        ReinsuranceTreatyType::ExcessOfLoss => {
+                            if amount > agreement.retention_limit {
+                                amount
+                                    .saturating_sub(agreement.retention_limit)
+                                    .min(agreement.coverage_limit)
+                            } else {
+                                0
+                            }
+                        }
+                        ReinsuranceTreatyType::QuotaShare => {
+                            amount.saturating_mul(agreement.premium_ceded_rate as u128) / 10_000
+                        }
+                        ReinsuranceTreatyType::Surplus => {
+                            if amount > agreement.retention_limit {
+                                amount
+                                    .saturating_sub(agreement.retention_limit)
+                                    .min(agreement.coverage_limit)
+                            } else {
+                                0
+                            }
+                        }
+                    };
 
-                    if capped_recovery > 0 {
-                        agreement.total_recoveries += capped_recovery;
+                    if recovery > 0 {
+                        // Record the loss recovery
+                        let recovery_id = self.loss_recovery_count + 1;
+                        self.loss_recovery_count = recovery_id;
+
+                        let loss_recovery = LossRecovery {
+                            recovery_id,
+                            agreement_id: i,
+                            claim_id,
+                            gross_loss: amount,
+                            recovered_amount: recovery,
+                            recovered_at: now,
+                        };
+                        self.loss_recoveries.insert(&recovery_id, &loss_recovery);
+
+                        let mut recoveries = self.agreement_recoveries.get(&i).unwrap_or_default();
+                        recoveries.push(recovery_id);
+                        self.agreement_recoveries.insert(&i, &recoveries);
+
+                        agreement.total_recoveries += recovery;
+                        agreement.recovery_count += 1;
                         self.reinsurance_agreements.insert(&i, &agreement);
 
                         self.env().emit_event(ReinsuranceActivated {
                             claim_id,
                             agreement_id: i,
-                            recovery_amount: capped_recovery,
+                            recovery_amount: recovery,
+                            timestamp: now,
+                        });
+
+                        self.env().emit_event(LossRecovered {
+                            agreement_id: i,
+                            claim_id,
+                            recovery_id,
+                            recovered_amount: recovery,
                             timestamp: now,
                         });
 

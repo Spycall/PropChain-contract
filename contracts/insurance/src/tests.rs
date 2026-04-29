@@ -855,293 +855,424 @@ mod insurance_tests {
     }
 
     // =========================================================================
-    // EXTERNAL INSURANCE PROVIDER TESTS (Issue #250)
+    // PARAMETRIC INSURANCE TESTS (Issue #249)
     // =========================================================================
 
-    use crate::propchain_insurance::CoverageRequestStatus;
+    use crate::propchain_insurance::{ParametricPolicyStatus, TriggerComparison};
 
-    fn register_provider(contract: &mut PropertyInsurance) -> u64 {
-        contract
-            .register_external_provider(
-                "Acme Insurance".into(),
-                "https://api.acme-insurance.com/v1".into(),
-                vec![CoverageType::Fire, CoverageType::Flood],
-            )
-            .expect("register provider failed")
-    }
-
-    fn setup_active_policy(contract: &mut PropertyInsurance) -> u64 {
+    fn setup_parametric(contract: &mut PropertyInsurance) -> (u64, u64) {
         let accounts = test::default_accounts::<DefaultEnvironment>();
         let pool_id = create_pool(contract);
+        // Fund the pool as alice
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
         test::set_value_transferred::<DefaultEnvironment>(10_000_000_000_000u128);
         contract.provide_pool_liquidity(pool_id).unwrap();
-        add_risk_assessment(contract, 1);
-        let calc = contract
-            .calculate_premium(1, 500_000_000_000u128, CoverageType::Fire)
-            .unwrap();
+        (pool_id, 1u64) // property_id = 1
+    }
+
+    #[ink::test]
+    fn test_create_parametric_policy_works() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let (pool_id, property_id) = setup_parametric(&mut contract);
+
         test::set_caller::<DefaultEnvironment>(accounts.bob);
-        test::set_value_transferred::<DefaultEnvironment>(calc.annual_premium * 2);
+        test::set_value_transferred::<DefaultEnvironment>(500_000_000u128);
+
+        let result = contract.create_parametric_policy(
+            property_id,
+            "flood_depth_cm".into(),
+            200,
+            TriggerComparison::GreaterThanOrEqual,
+            1_000_000_000_000u128,
+            pool_id,
+            86_400 * 365,
+        );
+        assert!(result.is_ok());
+        let policy_id = result.unwrap();
+        assert_eq!(policy_id, 1);
+
+        let policy = contract.get_parametric_policy(policy_id).unwrap();
+        assert_eq!(policy.policyholder, accounts.bob);
+        assert_eq!(policy.property_id, property_id);
+        assert_eq!(policy.metric, "flood_depth_cm");
+        assert_eq!(policy.trigger_threshold, 200);
+        assert_eq!(policy.coverage_amount, 1_000_000_000_000u128);
+        assert_eq!(policy.status, ParametricPolicyStatus::Active);
+        assert_eq!(contract.get_parametric_policy_count(), 1);
+    }
+
+    #[ink::test]
+    fn test_create_parametric_policy_zero_premium_fails() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let (pool_id, property_id) = setup_parametric(&mut contract);
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        test::set_value_transferred::<DefaultEnvironment>(0u128);
+
+        let result = contract.create_parametric_policy(
+            property_id,
+            "flood_depth_cm".into(),
+            200,
+            TriggerComparison::GreaterThanOrEqual,
+            1_000_000_000_000u128,
+            pool_id,
+            86_400 * 365,
+        );
+        assert_eq!(result, Err(InsuranceError::InsufficientPremium));
+    }
+
+    #[ink::test]
+    fn test_create_parametric_policy_nonexistent_pool_fails() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        test::set_value_transferred::<DefaultEnvironment>(500_000_000u128);
+
+        let result = contract.create_parametric_policy(
+            1,
+            "flood_depth_cm".into(),
+            200,
+            TriggerComparison::GreaterThanOrEqual,
+            1_000_000_000_000u128,
+            999,
+            86_400 * 365,
+        );
+        assert_eq!(result, Err(InsuranceError::PoolNotFound));
+    }
+
+    #[ink::test]
+    fn test_submit_oracle_data_triggers_payout() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let (pool_id, property_id) = setup_parametric(&mut contract);
+
+        // Bob creates a parametric policy: payout if flood_depth_cm >= 200
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        test::set_value_transferred::<DefaultEnvironment>(500_000_000u128);
         let policy_id = contract
-            .create_policy(
-                1,
-                CoverageType::Fire,
+            .create_parametric_policy(
+                property_id,
+                "flood_depth_cm".into(),
+                200,
+                TriggerComparison::GreaterThanOrEqual,
+                1_000_000_000_000u128,
+                pool_id,
+                86_400 * 365,
+            )
+            .unwrap();
+
+        // Oracle submits a value that crosses the threshold
+        test::set_caller::<DefaultEnvironment>(accounts.alice); // alice is admin/oracle
+        let data_id = contract
+            .submit_oracle_data(property_id, "flood_depth_cm".into(), 250)
+            .unwrap();
+        assert_eq!(data_id, 1);
+
+        // Policy should now be triggered
+        let policy = contract.get_parametric_policy(policy_id).unwrap();
+        assert_eq!(policy.status, ParametricPolicyStatus::Triggered);
+
+        // Pool capital should have decreased by coverage_amount
+        let pool = contract.get_pool(pool_id).unwrap();
+        // initial capital = 10_000_000_000_000 + premium_share; coverage = 1_000_000_000_000
+        assert!(pool.available_capital < 10_000_000_000_000u128);
+        assert_eq!(pool.total_claims_paid, 1_000_000_000_000u128);
+    }
+
+    #[ink::test]
+    fn test_submit_oracle_data_below_threshold_no_trigger() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let (pool_id, property_id) = setup_parametric(&mut contract);
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        test::set_value_transferred::<DefaultEnvironment>(500_000_000u128);
+        let policy_id = contract
+            .create_parametric_policy(
+                property_id,
+                "flood_depth_cm".into(),
+                200,
+                TriggerComparison::GreaterThanOrEqual,
+                1_000_000_000_000u128,
+                pool_id,
+                86_400 * 365,
+            )
+            .unwrap();
+
+        // Oracle submits a value below the threshold
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        contract
+            .submit_oracle_data(property_id, "flood_depth_cm".into(), 150)
+            .unwrap();
+
+        // Policy should still be active
+        let policy = contract.get_parametric_policy(policy_id).unwrap();
+        assert_eq!(policy.status, ParametricPolicyStatus::Active);
+    }
+
+    #[ink::test]
+    fn test_submit_oracle_data_less_than_or_equal_trigger() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let (pool_id, property_id) = setup_parametric(&mut contract);
+
+        // Policy: payout if temperature_tenths_c <= -100 (i.e. <= -10.0°C)
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        test::set_value_transferred::<DefaultEnvironment>(500_000_000u128);
+        let policy_id = contract
+            .create_parametric_policy(
+                property_id,
+                "temperature_tenths_c".into(),
+                -100,
+                TriggerComparison::LessThanOrEqual,
                 500_000_000_000u128,
                 pool_id,
                 86_400 * 365,
-                "ipfs://test".into(),
             )
-            .unwrap();
-        test::set_value_transferred::<DefaultEnvironment>(0);
-        policy_id
-    }
-
-    #[ink::test]
-    fn test_register_provider_works() {
-        let mut contract = setup();
-        let provider_id = register_provider(&mut contract);
-        assert_eq!(provider_id, 1);
-        assert_eq!(contract.get_provider_count(), 1);
-
-        let provider = contract.get_external_provider(provider_id).unwrap();
-        assert_eq!(provider.name, "Acme Insurance");
-        assert_eq!(provider.api_endpoint, "https://api.acme-insurance.com/v1");
-        assert!(provider.is_active);
-        assert!(provider.supported_coverage_types.contains(&CoverageType::Fire));
-    }
-
-    #[ink::test]
-    fn test_register_provider_unauthorized_fails() {
-        let mut contract = setup();
-        let accounts = test::default_accounts::<DefaultEnvironment>();
-        test::set_caller::<DefaultEnvironment>(accounts.bob);
-        let result = contract.register_external_provider(
-            "Rogue".into(),
-            "https://rogue.io".into(),
-            vec![CoverageType::Fire],
-        );
-        assert_eq!(result, Err(InsuranceError::Unauthorized));
-    }
-
-    #[ink::test]
-    fn test_deactivate_provider_works() {
-        let mut contract = setup();
-        let provider_id = register_provider(&mut contract);
-        assert!(contract.deactivate_external_provider(provider_id).is_ok());
-        let provider = contract.get_external_provider(provider_id).unwrap();
-        assert!(!provider.is_active);
-    }
-
-    #[ink::test]
-    fn test_deactivate_nonexistent_provider_fails() {
-        let mut contract = setup();
-        let result = contract.deactivate_external_provider(999);
-        assert_eq!(result, Err(InsuranceError::ProviderNotFound));
-    }
-
-    #[ink::test]
-    fn test_request_external_coverage_works() {
-        let mut contract = setup();
-        let accounts = test::default_accounts::<DefaultEnvironment>();
-        let provider_id = register_provider(&mut contract);
-        let policy_id = setup_active_policy(&mut contract);
-
-        test::set_caller::<DefaultEnvironment>(accounts.bob);
-        let result = contract.request_external_coverage(policy_id, provider_id, 200_000_000_000u128);
-        assert!(result.is_ok());
-        let request_id = result.unwrap();
-        assert_eq!(request_id, 1);
-
-        let request = contract.get_coverage_request(request_id).unwrap();
-        assert_eq!(request.policy_id, policy_id);
-        assert_eq!(request.provider_id, provider_id);
-        assert_eq!(request.coverage_amount, 200_000_000_000u128);
-        assert_eq!(request.status, CoverageRequestStatus::Pending);
-
-        let ids = contract.get_policy_coverage_requests(policy_id);
-        assert_eq!(ids, vec![request_id]);
-    }
-
-    #[ink::test]
-    fn test_request_coverage_non_policyholder_fails() {
-        let mut contract = setup();
-        let accounts = test::default_accounts::<DefaultEnvironment>();
-        let provider_id = register_provider(&mut contract);
-        let policy_id = setup_active_policy(&mut contract);
-
-        test::set_caller::<DefaultEnvironment>(accounts.charlie);
-        let result = contract.request_external_coverage(policy_id, provider_id, 100_000u128);
-        assert_eq!(result, Err(InsuranceError::Unauthorized));
-    }
-
-    #[ink::test]
-    fn test_request_coverage_inactive_provider_fails() {
-        let mut contract = setup();
-        let accounts = test::default_accounts::<DefaultEnvironment>();
-        let provider_id = register_provider(&mut contract);
-        contract.deactivate_external_provider(provider_id).unwrap();
-        let policy_id = setup_active_policy(&mut contract);
-
-        test::set_caller::<DefaultEnvironment>(accounts.bob);
-        let result = contract.request_external_coverage(policy_id, provider_id, 100_000u128);
-        assert_eq!(result, Err(InsuranceError::ProviderInactive));
-    }
-
-    #[ink::test]
-    fn test_request_coverage_unsupported_type_fails() {
-        let mut contract = setup();
-        let accounts = test::default_accounts::<DefaultEnvironment>();
-        // Provider only supports Fire and Flood; policy is Fire — create an Earthquake policy
-        let provider_id = contract
-            .register_external_provider(
-                "Limited Co".into(),
-                "https://limited.io".into(),
-                vec![CoverageType::Theft], // does NOT include Fire
-            )
-            .unwrap();
-        let policy_id = setup_active_policy(&mut contract); // Fire policy
-
-        test::set_caller::<DefaultEnvironment>(accounts.bob);
-        let result = contract.request_external_coverage(policy_id, provider_id, 100_000u128);
-        assert_eq!(result, Err(InsuranceError::UnsupportedCoverageType));
-    }
-
-    #[ink::test]
-    fn test_record_coverage_response_confirmed() {
-        let mut contract = setup();
-        let accounts = test::default_accounts::<DefaultEnvironment>();
-        let provider_id = register_provider(&mut contract);
-        let policy_id = setup_active_policy(&mut contract);
-
-        test::set_caller::<DefaultEnvironment>(accounts.bob);
-        let request_id = contract
-            .request_external_coverage(policy_id, provider_id, 200_000_000_000u128)
-            .unwrap();
-
-        // Admin records the provider's confirmation
-        test::set_caller::<DefaultEnvironment>(accounts.alice);
-        let result = contract.record_coverage_response(
-            request_id,
-            true,
-            5_000_000_000u128,
-            "ACME-POL-12345".into(),
-        );
-        assert!(result.is_ok());
-
-        let request = contract.get_coverage_request(request_id).unwrap();
-        assert_eq!(request.status, CoverageRequestStatus::Confirmed);
-        assert_eq!(request.provider_quote, 5_000_000_000u128);
-        assert_eq!(request.provider_reference, "ACME-POL-12345");
-        assert!(request.responded_at.is_some());
-    }
-
-    #[ink::test]
-    fn test_record_coverage_response_declined() {
-        let mut contract = setup();
-        let accounts = test::default_accounts::<DefaultEnvironment>();
-        let provider_id = register_provider(&mut contract);
-        let policy_id = setup_active_policy(&mut contract);
-
-        test::set_caller::<DefaultEnvironment>(accounts.bob);
-        let request_id = contract
-            .request_external_coverage(policy_id, provider_id, 200_000_000_000u128)
             .unwrap();
 
         test::set_caller::<DefaultEnvironment>(accounts.alice);
         contract
-            .record_coverage_response(request_id, false, 0, "Declined: high risk".into())
+            .submit_oracle_data(property_id, "temperature_tenths_c".into(), -150)
             .unwrap();
 
-        let request = contract.get_coverage_request(request_id).unwrap();
-        assert_eq!(request.status, CoverageRequestStatus::Declined);
+        let policy = contract.get_parametric_policy(policy_id).unwrap();
+        assert_eq!(policy.status, ParametricPolicyStatus::Triggered);
     }
 
     #[ink::test]
-    fn test_record_response_unauthorized_fails() {
+    fn test_submit_oracle_data_wrong_metric_no_trigger() {
         let mut contract = setup();
         let accounts = test::default_accounts::<DefaultEnvironment>();
-        let provider_id = register_provider(&mut contract);
-        let policy_id = setup_active_policy(&mut contract);
+        let (pool_id, property_id) = setup_parametric(&mut contract);
 
         test::set_caller::<DefaultEnvironment>(accounts.bob);
-        let request_id = contract
-            .request_external_coverage(policy_id, provider_id, 200_000_000_000u128)
+        test::set_value_transferred::<DefaultEnvironment>(500_000_000u128);
+        let policy_id = contract
+            .create_parametric_policy(
+                property_id,
+                "flood_depth_cm".into(),
+                200,
+                TriggerComparison::GreaterThanOrEqual,
+                1_000_000_000_000u128,
+                pool_id,
+                86_400 * 365,
+            )
             .unwrap();
 
-        // Bob is not an oracle
-        let result = contract.record_coverage_response(request_id, true, 0, "".into());
-        assert_eq!(result, Err(InsuranceError::Unauthorized));
-    }
-
-    #[ink::test]
-    fn test_record_response_twice_fails() {
-        let mut contract = setup();
-        let accounts = test::default_accounts::<DefaultEnvironment>();
-        let provider_id = register_provider(&mut contract);
-        let policy_id = setup_active_policy(&mut contract);
-
-        test::set_caller::<DefaultEnvironment>(accounts.bob);
-        let request_id = contract
-            .request_external_coverage(policy_id, provider_id, 200_000_000_000u128)
-            .unwrap();
-
+        // Oracle submits data for a different metric
         test::set_caller::<DefaultEnvironment>(accounts.alice);
         contract
-            .record_coverage_response(request_id, true, 1_000u128, "REF".into())
+            .submit_oracle_data(property_id, "wind_speed_kmh".into(), 300)
             .unwrap();
-        let result = contract.record_coverage_response(request_id, false, 0, "".into());
-        assert_eq!(result, Err(InsuranceError::CoverageRequestNotPending));
+
+        let policy = contract.get_parametric_policy(policy_id).unwrap();
+        assert_eq!(policy.status, ParametricPolicyStatus::Active);
     }
 
     #[ink::test]
-    fn test_cancel_coverage_request_works() {
+    fn test_submit_oracle_data_unauthorized_fails() {
         let mut contract = setup();
         let accounts = test::default_accounts::<DefaultEnvironment>();
-        let provider_id = register_provider(&mut contract);
-        let policy_id = setup_active_policy(&mut contract);
-
         test::set_caller::<DefaultEnvironment>(accounts.bob);
-        let request_id = contract
-            .request_external_coverage(policy_id, provider_id, 200_000_000_000u128)
-            .unwrap();
-
-        let result = contract.cancel_coverage_request(request_id);
-        assert!(result.is_ok());
-        let request = contract.get_coverage_request(request_id).unwrap();
-        assert_eq!(request.status, CoverageRequestStatus::Cancelled);
-    }
-
-    #[ink::test]
-    fn test_cancel_request_non_requester_fails() {
-        let mut contract = setup();
-        let accounts = test::default_accounts::<DefaultEnvironment>();
-        let provider_id = register_provider(&mut contract);
-        let policy_id = setup_active_policy(&mut contract);
-
-        test::set_caller::<DefaultEnvironment>(accounts.bob);
-        let request_id = contract
-            .request_external_coverage(policy_id, provider_id, 200_000_000_000u128)
-            .unwrap();
-
-        test::set_caller::<DefaultEnvironment>(accounts.charlie);
-        let result = contract.cancel_coverage_request(request_id);
+        let result = contract.submit_oracle_data(1, "flood_depth_cm".into(), 300);
         assert_eq!(result, Err(InsuranceError::Unauthorized));
     }
 
     #[ink::test]
-    fn test_authorized_oracle_can_record_response() {
+    fn test_authorized_oracle_can_submit_data() {
         let mut contract = setup();
         let accounts = test::default_accounts::<DefaultEnvironment>();
-        contract.authorize_oracle(accounts.charlie).unwrap();
-        let provider_id = register_provider(&mut contract);
-        let policy_id = setup_active_policy(&mut contract);
+        contract.authorize_oracle(accounts.bob).unwrap();
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        let result = contract.submit_oracle_data(1, "flood_depth_cm".into(), 100);
+        assert!(result.is_ok());
+        let data = contract.get_oracle_data(1).unwrap();
+        assert_eq!(data.value, 100);
+        assert_eq!(data.submitted_by, accounts.bob);
+    }
+
+    #[ink::test]
+    fn test_cancel_parametric_policy_works() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let (pool_id, property_id) = setup_parametric(&mut contract);
 
         test::set_caller::<DefaultEnvironment>(accounts.bob);
-        let request_id = contract
-            .request_external_coverage(policy_id, provider_id, 200_000_000_000u128)
+        test::set_value_transferred::<DefaultEnvironment>(500_000_000u128);
+        let policy_id = contract
+            .create_parametric_policy(
+                property_id,
+                "flood_depth_cm".into(),
+                200,
+                TriggerComparison::GreaterThanOrEqual,
+                1_000_000_000_000u128,
+                pool_id,
+                86_400 * 365,
+            )
+            .unwrap();
+
+        let result = contract.cancel_parametric_policy(policy_id);
+        assert!(result.is_ok());
+        let policy = contract.get_parametric_policy(policy_id).unwrap();
+        assert_eq!(policy.status, ParametricPolicyStatus::Cancelled);
+    }
+
+    #[ink::test]
+    fn test_cancel_parametric_policy_by_non_owner_fails() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let (pool_id, property_id) = setup_parametric(&mut contract);
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        test::set_value_transferred::<DefaultEnvironment>(500_000_000u128);
+        let policy_id = contract
+            .create_parametric_policy(
+                property_id,
+                "flood_depth_cm".into(),
+                200,
+                TriggerComparison::GreaterThanOrEqual,
+                1_000_000_000_000u128,
+                pool_id,
+                86_400 * 365,
+            )
             .unwrap();
 
         test::set_caller::<DefaultEnvironment>(accounts.charlie);
-        let result = contract.record_coverage_response(request_id, true, 1_000u128, "REF".into());
-        assert!(result.is_ok());
+        let result = contract.cancel_parametric_policy(policy_id);
+        assert_eq!(result, Err(InsuranceError::Unauthorized));
+    }
+
+    #[ink::test]
+    fn test_cancel_triggered_policy_fails() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let (pool_id, property_id) = setup_parametric(&mut contract);
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        test::set_value_transferred::<DefaultEnvironment>(500_000_000u128);
+        let policy_id = contract
+            .create_parametric_policy(
+                property_id,
+                "flood_depth_cm".into(),
+                200,
+                TriggerComparison::GreaterThanOrEqual,
+                1_000_000_000_000u128,
+                pool_id,
+                86_400 * 365,
+            )
+            .unwrap();
+
+        // Trigger the policy
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        contract
+            .submit_oracle_data(property_id, "flood_depth_cm".into(), 250)
+            .unwrap();
+
+        // Try to cancel after trigger
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        let result = contract.cancel_parametric_policy(policy_id);
+        assert_eq!(result, Err(InsuranceError::ParametricPolicyInactive));
+    }
+
+    #[ink::test]
+    fn test_multiple_parametric_policies_same_property() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let (pool_id, property_id) = setup_parametric(&mut contract);
+
+        // Bob creates two policies for the same property
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        test::set_value_transferred::<DefaultEnvironment>(500_000_000u128);
+        let p1 = contract
+            .create_parametric_policy(
+                property_id,
+                "flood_depth_cm".into(),
+                200,
+                TriggerComparison::GreaterThanOrEqual,
+                500_000_000_000u128,
+                pool_id,
+                86_400 * 365,
+            )
+            .unwrap();
+
+        test::set_value_transferred::<DefaultEnvironment>(500_000_000u128);
+        let p2 = contract
+            .create_parametric_policy(
+                property_id,
+                "flood_depth_cm".into(),
+                300,
+                TriggerComparison::GreaterThanOrEqual,
+                500_000_000_000u128,
+                pool_id,
+                86_400 * 365,
+            )
+            .unwrap();
+
+        // Oracle submits value 250: triggers p1 (>=200) but not p2 (>=300)
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        contract
+            .submit_oracle_data(property_id, "flood_depth_cm".into(), 250)
+            .unwrap();
+
+        assert_eq!(
+            contract.get_parametric_policy(p1).unwrap().status,
+            ParametricPolicyStatus::Triggered
+        );
+        assert_eq!(
+            contract.get_parametric_policy(p2).unwrap().status,
+            ParametricPolicyStatus::Active
+        );
+    }
+
+    #[ink::test]
+    fn test_get_property_parametric_policies() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let (pool_id, property_id) = setup_parametric(&mut contract);
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        test::set_value_transferred::<DefaultEnvironment>(500_000_000u128);
+        contract
+            .create_parametric_policy(
+                property_id,
+                "flood_depth_cm".into(),
+                200,
+                TriggerComparison::GreaterThanOrEqual,
+                500_000_000_000u128,
+                pool_id,
+                86_400 * 365,
+            )
+            .unwrap();
+
+        let ids = contract.get_property_parametric_policies(property_id);
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0], 1);
+    }
+
+    #[ink::test]
+    fn test_get_holder_parametric_policies() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let (pool_id, property_id) = setup_parametric(&mut contract);
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        test::set_value_transferred::<DefaultEnvironment>(500_000_000u128);
+        contract
+            .create_parametric_policy(
+                property_id,
+                "flood_depth_cm".into(),
+                200,
+                TriggerComparison::GreaterThanOrEqual,
+                500_000_000_000u128,
+                pool_id,
+                86_400 * 365,
+            )
+            .unwrap();
+
+        let ids = contract.get_holder_parametric_policies(accounts.bob);
+        assert_eq!(ids.len(), 1);
     }
 }
