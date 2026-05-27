@@ -17,6 +17,10 @@ pub enum Error {
     GasLimitExceeded,
     RateLimitExceeded,
     ReentrantCall,
+    /// No cross-chain transaction status record exists for the given identifier.
+    TransactionNotFound,
+    /// The requested status transition is not valid for the current status.
+    InvalidStatusTransition,
 }
 
 impl core::fmt::Display for Error {
@@ -36,6 +40,8 @@ impl core::fmt::Display for Error {
             Error::GasLimitExceeded => write!(f, "Gas limit exceeded"),
             Error::RateLimitExceeded => write!(f, "Rate limit exceeded"),
             Error::ReentrantCall => write!(f, "Reentrant call"),
+            Error::TransactionNotFound => write!(f, "Cross-chain transaction not found"),
+            Error::InvalidStatusTransition => write!(f, "Invalid cross-chain status transition"),
         }
     }
 }
@@ -57,6 +63,8 @@ impl ContractError for Error {
             Error::GasLimitExceeded => bridge_codes::BRIDGE_GAS_LIMIT_EXCEEDED,
             Error::RateLimitExceeded => bridge_codes::BRIDGE_RATE_LIMIT_EXCEEDED,
             Error::ReentrantCall => bridge_codes::REENTRANT_CALL,
+            Error::TransactionNotFound => bridge_codes::BRIDGE_TRANSACTION_NOT_FOUND,
+            Error::InvalidStatusTransition => bridge_codes::BRIDGE_INVALID_STATUS_TRANSITION,
         }
     }
 
@@ -80,6 +88,12 @@ impl ContractError for Error {
             Error::GasLimitExceeded => "The operation exceeded the gas limit",
             Error::RateLimitExceeded => "The operation exceeded the daily rate limit",
             Error::ReentrantCall => "Reentrancy guard detected a reentrant call",
+            Error::TransactionNotFound => {
+                "No cross-chain transaction status record exists for the given identifier"
+            }
+            Error::InvalidStatusTransition => {
+                "The requested per-chain status transition is not allowed from the current status"
+            }
         }
     }
 

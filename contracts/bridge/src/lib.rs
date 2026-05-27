@@ -41,6 +41,15 @@ mod bridge {
         /// Cross-chain DEX settlement intents tracked by the bridge
         cross_chain_trades: Mapping<u64, CrossChainTradeIntent>,
 
+        /// Per-request cross-chain transaction status tracker. Stores the
+        /// per-chain status of every bridge request so callers and indexers
+        /// can observe the full lifecycle on both source and destination.
+        cross_chain_tx_status: Mapping<u64, CrossChainTxStatus>,
+
+        /// Reverse index from a chain-native transaction hash to the bridge
+        /// `request_id`, enabling status lookups by hash from any chain.
+        tx_hash_index: Mapping<Hash, u64>,
+
         /// Bridge operators
         bridge_operators: Vec<AccountId>,
 

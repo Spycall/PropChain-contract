@@ -167,6 +167,81 @@ pub struct BridgeFeeQuote {
 }
 
 // =========================================================================
+// Cross-chain transaction status tracking (per-chain visibility)
+// =========================================================================
+
+/// Per-chain transaction status. Each leg of a cross-chain transfer
+/// (source-chain lock + destination-chain mint/release) carries one of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, scale::Encode, scale::Decode)]
+#[cfg_attr(
+    feature = "std",
+    derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout)
+)]
+pub enum ChainTxStatus {
+    /// No activity has occurred on this chain for the request yet.
+    NotStarted,
+    /// The transaction has been broadcast to the chain but not yet included.
+    Submitted,
+    /// The transaction is included but is still awaiting confirmations.
+    Confirming,
+    /// The transaction is finalized on this chain.
+    Confirmed,
+    /// The transaction failed on this chain (reverted, dropped, or timed out).
+    Failed,
+}
+
+/// Snapshot of the transaction state on a single chain at a given point.
+#[derive(Debug, Clone, PartialEq, scale::Encode, scale::Decode)]
+#[cfg_attr(
+    feature = "std",
+    derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout)
+)]
+pub struct ChainStatusUpdate {
+    /// The chain this update applies to.
+    pub chain_id: ChainId,
+    /// Latest known status on that chain.
+    pub status: ChainTxStatus,
+    /// Hash of the chain-native transaction, once known.
+    pub tx_hash: Option<ink::primitives::Hash>,
+    /// Block number of the chain-native tx (relayer-supplied for foreign chains,
+    /// `env().block_number()` for the local chain).
+    pub block_number: u64,
+    /// Timestamp when the update was recorded on the bridge contract.
+    pub timestamp: u64,
+    /// Number of confirmations observed (0 until inclusion).
+    pub confirmations: u32,
+    /// Optional human-readable reason in case of failure.
+    pub error_message: Option<String>,
+}
+
+/// Aggregated status of a cross-chain transaction across all chains involved.
+///
+/// One record is created per bridge request and is updated as the request
+/// progresses on each chain. `history` retains a chronological audit trail of
+/// every update so off-chain indexers can replay the full lifecycle.
+#[derive(Debug, Clone, PartialEq, scale::Encode, scale::Decode)]
+#[cfg_attr(
+    feature = "std",
+    derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout)
+)]
+pub struct CrossChainTxStatus {
+    pub request_id: u64,
+    pub token_id: TokenId,
+    pub source_chain: ChainId,
+    pub destination_chain: ChainId,
+    /// Latest status snapshot on the source chain.
+    pub source_status: ChainStatusUpdate,
+    /// Latest status snapshot on the destination chain.
+    pub destination_status: ChainStatusUpdate,
+    /// Aggregated overall status derived from both legs.
+    pub overall_status: BridgeOperationStatus,
+    /// Full chronological log of every per-chain update.
+    pub history: Vec<ChainStatusUpdate>,
+    /// Block timestamp of the most recent update.
+    pub last_updated: u64,
+}
+
+// =========================================================================
 // Trait Definitions
 // =========================================================================
 
