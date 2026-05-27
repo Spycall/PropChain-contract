@@ -125,7 +125,7 @@ mod tests {
         let accounts = default_accounts();
 
         set_caller(accounts.alice);
-        staking.fund_reward_pool(1_000_000_000_000).unwrap();
+        staking.fund_reward_pool(10_000_000_000_000).unwrap();
 
         set_caller(accounts.bob);
         staking
@@ -520,4 +520,74 @@ mod tests {
 
         assert_eq!(staking.get_min_stake(), 2_000);
     }
+
+    #[ink::test]
+    fn set_auto_compound_succeeds() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+        set_caller(accounts.bob);
+        staking.stake(10_000, LockPeriod::Flexible).unwrap();
+        
+        let stake_info = staking.get_stake(accounts.bob).unwrap();
+        assert_eq!(stake_info.auto_compound, false);
+        
+        staking.set_auto_compound(true).unwrap();
+        let stake_info = staking.get_stake(accounts.bob).unwrap();
+        assert_eq!(stake_info.auto_compound, true);
+    }
+
+    #[ink::test]
+    fn auto_compounding_reinvests_rewards() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+        
+        set_caller(accounts.alice);
+        staking.fund_reward_pool(10_000_000_000_000).unwrap();
+
+        set_caller(accounts.bob);
+        staking.stake(1_000_000_000_000_000, LockPeriod::Flexible).unwrap();
+        staking.set_auto_compound(true).unwrap();
+
+        advance_block(100_000);
+
+        let initial_stake = staking.get_stake(accounts.bob).unwrap().amount;
+        let pending = staking.get_pending_rewards(accounts.bob);
+        assert!(pending > 0);
+
+        staking.claim_rewards().unwrap();
+
+        let final_stake = staking.get_stake(accounts.bob).unwrap().amount;
+        assert_eq!(final_stake, initial_stake + pending);
+    }
+
+    #[ink::test]
+    fn staking_tiers_applied_correctly() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+        
+        // Bob stakes Bronze amount (< 10_000)
+        set_caller(accounts.bob);
+        staking.stake(5_000, LockPeriod::Flexible).unwrap();
+        assert_eq!(staking.get_staker_tier(accounts.bob), StakingTier::Bronze);
+
+        // Charlie stakes Silver amount (>= 10_000)
+        set_caller(accounts.charlie);
+        staking.stake(15_000, LockPeriod::Flexible).unwrap();
+        assert_eq!(staking.get_staker_tier(accounts.charlie), StakingTier::Silver);
+
+        // Django stakes Gold amount (>= 50_000)
+        let django = accounts.django;
+        set_caller(django);
+        staking.stake(55_000, LockPeriod::Flexible).unwrap();
+        assert_eq!(staking.get_staker_tier(django), StakingTier::Gold);
+
+        // Verify tier name and multiplier
+        assert_eq!(StakingTier::Bronze.name(), "Bronze");
+        assert_eq!(StakingTier::Bronze.reward_multiplier(), 100);
+        assert_eq!(StakingTier::Silver.reward_multiplier(), 110);
+        assert_eq!(StakingTier::Gold.reward_multiplier(), 120);
+        assert_eq!(StakingTier::Platinum.reward_multiplier(), 135);
+        assert_eq!(StakingTier::Diamond.reward_multiplier(), 150);
+    }
 }
+

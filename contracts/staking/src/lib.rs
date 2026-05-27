@@ -75,6 +75,20 @@ mod staking {
     }
 
     #[ink(event)]
+    pub struct AutoCompoundUpdated {
+        #[ink(topic)]
+        pub staker: AccountId,
+        pub auto_compound: bool,
+    }
+
+    #[ink(event)]
+    pub struct RewardsReinvested {
+        #[ink(topic)]
+        pub staker: AccountId,
+        pub amount: u128,
+    }
+
+    #[ink(event)]
     pub struct ParamProposalCreated {
         #[ink(topic)]
         pub proposal_id: u64,
@@ -256,6 +270,7 @@ mod staking {
                 lock_period,
                 reward_debt: self.acc_reward_per_share,
                 governance_delegate: None,
+                auto_compound: false,
             };
 
             self.stakes.insert(caller, &stake_info);
@@ -326,17 +341,63 @@ mod staking {
                     return Err(Error::InsufficientPool);
                 }
 
+                let now = self.env().block_number() as u64;
                 self.reward_pool = self.reward_pool.saturating_sub(rewards);
-                stake.reward_debt = self.acc_reward_per_share;
-                self.stakes.insert(caller, &stake);
 
-                self.env().emit_event(RewardsClaimed {
-                    staker: caller,
-                    amount: rewards,
-                });
+                if stake.auto_compound {
+                    stake.amount = stake.amount.saturating_add(rewards);
+                    self.total_staked = self.total_staked.saturating_add(rewards);
+
+                    // Update governance power
+                    let power_holder = stake.governance_delegate.unwrap_or(stake.staker);
+                    let current_power = self.governance_power.get(power_holder).unwrap_or(0);
+                    self.governance_power.insert(power_holder, &current_power.saturating_add(rewards));
+
+                    stake.staked_at = now;
+                    stake.reward_debt = self.acc_reward_per_share;
+                    self.stakes.insert(caller, &stake);
+
+                    self.env().emit_event(RewardsReinvested {
+                        staker: caller,
+                        amount: rewards,
+                    });
+                } else {
+                    stake.staked_at = now;
+                    stake.reward_debt = self.acc_reward_per_share;
+                    self.stakes.insert(caller, &stake);
+
+                    self.env().emit_event(RewardsClaimed {
+                        staker: caller,
+                        amount: rewards,
+                    });
+                }
 
                 Ok(rewards)
             })
+        }
+
+        /// Opt-in or opt-out of automatic compounding.
+        #[ink(message)]
+        pub fn set_auto_compound(&mut self, auto_compound: bool) -> Result<(), Error> {
+            let caller = self.env().caller();
+            let mut stake = self.stakes.get(caller).ok_or(Error::StakeNotFound)?;
+            stake.auto_compound = auto_compound;
+            self.stakes.insert(caller, &stake);
+            self.env().emit_event(AutoCompoundUpdated {
+                staker: caller,
+                auto_compound,
+            });
+            Ok(())
+        }
+
+        /// Returns the staking tier for a staker.
+        #[ink(message)]
+        pub fn get_staker_tier(&self, staker: AccountId) -> StakingTier {
+            if let Some(stake) = self.stakes.get(staker) {
+                self.get_tier_internal(stake.amount)
+            } else {
+                StakingTier::Bronze
+            }
         }
 
         /// Delegate governance power to another address.
@@ -638,7 +699,26 @@ mod staking {
                 / 5_256_000; // blocks per year
 
             let multiplier = stake.lock_period.multiplier();
-            base_reward.saturating_mul(multiplier) / 100
+            let reward = base_reward.saturating_mul(multiplier) / 100;
+
+            // Apply staking tier bonus multiplier
+            let tier = self.get_tier_internal(stake.amount);
+            let tier_multiplier = tier.reward_multiplier();
+            reward.saturating_mul(tier_multiplier) / 100
+        }
+
+        fn get_tier_internal(&self, amount: u128) -> StakingTier {
+            if amount >= 500_000 {
+                StakingTier::Diamond
+            } else if amount >= 100_000 {
+                StakingTier::Platinum
+            } else if amount >= 50_000 {
+                StakingTier::Gold
+            } else if amount >= 10_000 {
+                StakingTier::Silver
+            } else {
+                StakingTier::Bronze
+            }
         }
 
         fn validate_param(kind: &ParamKind) -> Result<(), Error> {

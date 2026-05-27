@@ -61,4 +61,24 @@ pub struct GovernanceProposal {
     pub created_at: u64,
     pub executed_at: u64,
     pub timelock_until: u64,
+    pub is_emergency: bool,
 }
+
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    scale::Encode,
+    scale::Decode,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub struct GovernanceAnalytics {
+    pub total_proposals: u64,
+    pub executed_proposals: u64,
+    pub rejected_proposals: u64,
+    pub cancelled_proposals: u64,
+    pub active_proposals: u64,
+    pub avg_participation_bps: u32,
+}
+

@@ -56,7 +56,50 @@ pub struct StakeInfo {
     pub lock_period: LockPeriod,
     pub reward_debt: u128,
     pub governance_delegate: Option<AccountId>,
+    pub auto_compound: bool,
 }
+
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    scale::Encode,
+    scale::Decode,
+    ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub enum StakingTier {
+    Bronze,
+    Silver,
+    Gold,
+    Platinum,
+    Diamond,
+}
+
+impl StakingTier {
+    pub fn name(&self) -> &'static str {
+        match self {
+            StakingTier::Bronze => "Bronze",
+            StakingTier::Silver => "Silver",
+            StakingTier::Gold => "Gold",
+            StakingTier::Platinum => "Platinum",
+            StakingTier::Diamond => "Diamond",
+        }
+    }
+
+    pub fn reward_multiplier(&self) -> u128 {
+        match self {
+            StakingTier::Bronze => 100,      // 1.0x
+            StakingTier::Silver => 110,      // 1.1x
+            StakingTier::Gold => 120,        // 1.2x
+            StakingTier::Platinum => 135,    // 1.35x
+            StakingTier::Diamond => 150,     // 1.5x
+        }
+    }
+}
+
 
 /// A staking parameter that stakers can vote to change.
 #[derive(

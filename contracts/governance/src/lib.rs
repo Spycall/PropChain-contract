@@ -199,6 +199,7 @@ mod governance {
                 created_at: now,
                 executed_at: 0,
                 timelock_until: 0,
+                is_emergency: false,
             };
 
             self.proposals.insert(proposal_id, &proposal);
@@ -212,6 +213,139 @@ mod governance {
             });
 
             Ok(proposal_id)
+        }
+
+        /// Creates a new emergency proposal. Only signers may propose.
+        /// Emergency proposals require unanimous signer approval but bypass the timelock.
+        #[ink(message)]
+        pub fn create_emergency_proposal(
+            &mut self,
+            description_hash: Hash,
+            action_type: GovernanceAction,
+            target: Option<AccountId>,
+        ) -> Result<u64, Error> {
+            let caller = self.env().caller();
+            self.ensure_signer(caller)?;
+
+            if self.active_proposal_count >= constants::GOVERNANCE_MAX_ACTIVE_PROPOSALS {
+                return Err(Error::MaxProposals);
+            }
+
+            let proposal_id = self.proposal_counter;
+            self.proposal_counter = self.proposal_counter.saturating_add(1);
+            let now = self.env().block_number() as u64;
+
+            // Unanimous approval required for emergency
+            let emergency_threshold = self.signers.len() as u32;
+
+            let proposal = GovernanceProposal {
+                id: proposal_id,
+                proposer: caller,
+                description_hash,
+                action_type: action_type.clone(),
+                target,
+                threshold: emergency_threshold,
+                votes_for: 0,
+                votes_against: 0,
+                status: ProposalStatus::Active,
+                created_at: now,
+                executed_at: 0,
+                timelock_until: 0,
+                is_emergency: true,
+            };
+
+            self.proposals.insert(proposal_id, &proposal);
+            self.active_proposal_count = self.active_proposal_count.saturating_add(1);
+
+            self.env().emit_event(ProposalCreated {
+                proposal_id,
+                proposer: caller,
+                action_type,
+                threshold: emergency_threshold,
+            });
+
+            Ok(proposal_id)
+        }
+
+        /// Returns the governance analytics.
+        #[ink(message)]
+        pub fn get_analytics(&self) -> GovernanceAnalytics {
+            let total = self.proposal_counter;
+            let mut executed = 0;
+            let mut rejected = 0;
+            let mut cancelled = 0;
+            let mut active = 0;
+            
+            let mut total_participation_bps: u64 = 0;
+            let mut closed_count = 0;
+            
+            let signer_count = self.signers.len() as u64;
+            
+            for id in 0..total {
+                if let Some(proposal) = self.proposals.get(id) {
+                    match proposal.status {
+                        ProposalStatus::Active => active += 1,
+                        ProposalStatus::Approved => active += 1,
+                        ProposalStatus::Executed => {
+                            executed += 1;
+                            closed_count += 1;
+                            if signer_count > 0 {
+                                let total_votes = (proposal.votes_for.saturating_add(proposal.votes_against)) as u64;
+                                let bps = total_votes.saturating_mul(10_000) / signer_count;
+                                total_participation_bps = total_participation_bps.saturating_add(bps);
+                            }
+                        }
+                        ProposalStatus::Rejected => {
+                            rejected += 1;
+                            closed_count += 1;
+                            if signer_count > 0 {
+                                let total_votes = (proposal.votes_for.saturating_add(proposal.votes_against)) as u64;
+                                let bps = total_votes.saturating_mul(10_000) / signer_count;
+                                total_participation_bps = total_participation_bps.saturating_add(bps);
+                            }
+                        }
+                        ProposalStatus::Cancelled => {
+                            cancelled += 1;
+                        }
+                        ProposalStatus::Expired => {
+                            closed_count += 1;
+                            if signer_count > 0 {
+                                let total_votes = (proposal.votes_for.saturating_add(proposal.votes_against)) as u64;
+                                let bps = total_votes.saturating_mul(10_000) / signer_count;
+                                total_participation_bps = total_participation_bps.saturating_add(bps);
+                            }
+                        }
+                    }
+                }
+            }
+            
+            let avg_participation_bps = if closed_count > 0 {
+                (total_participation_bps / closed_count) as u32
+            } else {
+                0
+            };
+            
+            GovernanceAnalytics {
+                total_proposals: total,
+                executed_proposals: executed,
+                rejected_proposals: rejected,
+                cancelled_proposals: cancelled,
+                active_proposals: active,
+                avg_participation_bps,
+            }
+        }
+
+        /// Returns the participation rate for a specific proposal in basis points.
+        #[ink(message)]
+        pub fn get_proposal_participation(&self, proposal_id: u64) -> Result<u32, Error> {
+            let proposal = self.proposals.get(proposal_id).ok_or(Error::ProposalNotFound)?;
+            let signer_count = self.signers.len() as u32;
+            if signer_count == 0 {
+                return Ok(0);
+            }
+            let total_votes = proposal.votes_for.saturating_add(proposal.votes_against);
+            let bps = (total_votes as u64).saturating_mul(10_000) / (signer_count as u64);
+            Ok(bps as u32)
         }
 
         /// Casts a vote on an active proposal. Only signers may vote.
@@ -244,7 +378,11 @@ mod governance {
             if proposal.votes_for >= proposal.threshold {
                 let now = self.env().block_number() as u64;
                 proposal.status = ProposalStatus::Approved;
-                proposal.timelock_until = now.saturating_add(self.timelock_blocks);
+                if proposal.is_emergency {
+                    proposal.timelock_until = now; // Bypass timelock
+                } else {
+                    proposal.timelock_until = now.saturating_add(self.timelock_blocks);
+                }
                 self.active_proposal_count = self.active_proposal_count.saturating_sub(1);
             }
 
@@ -574,4 +712,5 @@ mod governance {
     // =========================================================================
     // Tests
     // =========================================================================
+    include!("tests.rs");
 }
