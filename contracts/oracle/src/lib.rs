@@ -96,6 +96,18 @@ mod propchain_oracle {
         multisig_proposals: Mapping<u64, MultiSigProposal>,
         /// Counter for generating unique proposal ids.
         multisig_proposal_counter: u64,
+
+        // ── Enhanced Slashing (Issue #226) ───────────────────────────────────
+        /// Slashing configuration parameters
+        slashing_config: SlashingConfig,
+        /// Slashing records per source: source_id -> Vec<SlashingRecord>
+        slashing_records: Mapping<String, Vec<SlashingRecord>>,
+        /// Total slashing count per source
+        slashing_counts: Mapping<String, u32>,
+        /// Total slashed amount per source
+        slashed_amounts: Mapping<String, u128>,
+        /// Whether a source is banned: source_id -> banned_until_block (0 = not banned)
+        banned_sources: Mapping<String, u64>,
     }
 
     /// A pending multi-sig proposal for a critical oracle operation.
@@ -181,6 +193,47 @@ mod propchain_oracle {
         proposal_id: u64,
     }
 
+    // ── Enhanced Slashing Events (Issue #226) ────────────────────────────────
+
+    /// Emitted when an oracle source is slashed with a severity level.
+    #[ink(event)]
+    pub struct SourceSlashed {
+        #[ink(topic)]
+        source_id: String,
+        severity: SlashingSeverity,
+        amount_slashed: u128,
+        remaining_stake: u128,
+        reason: String,
+    }
+
+    /// Emitted when an oracle source is automatically suspended due to
+    /// exceeding the slashing threshold.
+    #[ink(event)]
+    pub struct SourceSuspended {
+        #[ink(topic)]
+        source_id: String,
+        total_slashes: u32,
+        suspension_threshold: u32,
+    }
+
+    /// Emitted when a source is banned after a critical slashing.
+    #[ink(event)]
+    pub struct SourceBanned {
+        #[ink(topic)]
+        source_id: String,
+        #[ink(topic)]
+        admin: AccountId,
+        ban_until_block: u64,
+    }
+
+    /// Emitted when a source's ban is lifted.
+    #[ink(event)]
+    pub struct SourceUnbanned {
+        #[ink(topic)]
+        source_id: String,
+        admin: AccountId,
+    }
+
     include!("types.rs");
 
     impl PropertyValuationOracle {
@@ -231,6 +284,12 @@ mod propchain_oracle {
                 multisig_threshold: 1,
                 multisig_proposals: Mapping::default(),
                 multisig_proposal_counter: 0,
+                // Enhanced slashing defaults (Issue #226)
+                slashing_config: SlashingConfig::default(),
+                slashing_records: Mapping::default(),
+                slashing_counts: Mapping::default(),
+                slashed_amounts: Mapping::default(),
+                banned_sources: Mapping::default(),
             }
         }
 
@@ -634,7 +693,12 @@ mod propchain_oracle {
             Ok(())
         }
 
-        /// Slash an oracle source for providing bad data (admin only)
+        /// Slash an oracle source with graduated severity (admin only).
+        ///
+        /// - `Minor`:    5% stake slash, -50 reputation
+        /// - `Moderate`: 15% stake slash, -150 reputation
+        /// - `Severe`:   30% stake slash, -300 reputation, auto-suspension if threshold exceeded
+        /// - `Critical`: 50% stake slash, -500 reputation, source banned
         #[ink(message)]
         pub fn slash_source(
             &mut self,
@@ -651,6 +715,198 @@ mod propchain_oracle {
             self.update_source_reputation(source_id, false)?;
 
             Ok(())
+        }
+
+        /// Slash an oracle source with graduated severity (admin only).
+        /// Uses the configured basis points for each severity level.
+        #[ink(message)]
+        pub fn slash_source_with_severity(
+            &mut self,
+            source_id: String,
+            severity: SlashingSeverity,
+            reason: String,
+        ) -> Result<(), OracleError> {
+            self.ensure_admin()?;
+
+            let current_stake = self.source_stakes.get(&source_id).unwrap_or(0);
+            if current_stake == 0 {
+                return Err(OracleError::InvalidParameters);
+            }
+
+            // Calculate slash percentage from config based on severity
+            let slash_bps = match severity {
+                SlashingSeverity::Minor => self.slashing_config.minor_slash_bps,
+                SlashingSeverity::Moderate => self.slashing_config.moderate_slash_bps,
+                SlashingSeverity::Severe => self.slashing_config.severe_slash_bps,
+                SlashingSeverity::Critical => self.slashing_config.critical_slash_bps,
+            };
+            let reput_penalty = match severity {
+                SlashingSeverity::Minor => self.slashing_config.minor_reputation_penalty,
+                SlashingSeverity::Moderate => self.slashing_config.moderate_reputation_penalty,
+                SlashingSeverity::Severe => self.slashing_config.severe_reputation_penalty,
+                SlashingSeverity::Critical => self.slashing_config.critical_reputation_penalty,
+            };
+
+            let slash_amount = current_stake
+                .saturating_mul(slash_bps as u128)
+                / 10_000;
+            let remaining_stake = current_stake.saturating_sub(slash_amount);
+
+            // Apply stake slash
+            self.source_stakes.insert(&source_id, &remaining_stake);
+
+            // Apply reputation penalty
+            let current_rep = self.source_reputations.get(&source_id).unwrap_or(500);
+            let new_rep = current_rep.saturating_sub(reput_penalty);
+            self.source_reputations.insert(&source_id, &new_rep);
+
+            // Track slashing record
+            let mut records = self.slashing_records.get(&source_id).unwrap_or_default();
+            let block = self.env().block_number();
+            let mut banned = false;
+            records.push(SlashingRecord {
+                block,
+                severity: severity.clone(),
+                amount_slashed: slash_amount,
+                reason: reason.clone(),
+                banned: false, // updated below if ban occurs
+            });
+            self.slashing_records.insert(&source_id, &records);
+
+            // Update running totals
+            let current_count = self.slashing_counts.get(&source_id).unwrap_or(0);
+            self.slashing_counts.insert(&source_id, &(current_count + 1));
+            let current_amount = self.slashed_amounts.get(&source_id).unwrap_or(0);
+            self.slashed_amounts.insert(&source_id, &current_amount.saturating_add(slash_amount));
+
+            // Auto-suspend if slashing count exceeds threshold
+            if current_count + 1 >= self.slashing_config.suspension_threshold {
+                if let Some(mut source) = self.oracle_sources.get(&source_id) {
+                    source.is_active = false;
+                    self.oracle_sources.insert(&source_id, &source);
+                    self.active_sources.retain(|id| id != &source_id);
+                }
+                self.env().emit_event(SourceSuspended {
+                    source_id: source_id.clone(),
+                    total_slashes: current_count + 1,
+                    suspension_threshold: self.slashing_config.suspension_threshold,
+                });
+            }
+
+            // Ban on critical severity
+            if matches!(severity, SlashingSeverity::Critical) {
+                let ban_until = block.saturating_add(self.slashing_config.ban_duration_blocks);
+                self.banned_sources.insert(&source_id, &ban_until);
+                banned = true;
+                // Deactivate source
+                if let Some(mut source) = self.oracle_sources.get(&source_id) {
+                    source.is_active = false;
+                    self.oracle_sources.insert(&source_id, &source);
+                    self.active_sources.retain(|id| id != &source_id);
+                }
+                self.env().emit_event(SourceBanned {
+                    source_id: source_id.clone(),
+                    admin: self.env().caller(),
+                    ban_until_block: ban_until,
+                });
+            }
+
+            // Update the last record's banned flag
+            if let Some(mut updated_records) = self.slashing_records.get(&source_id) {
+                if let Some(last) = updated_records.last_mut() {
+                    last.banned = banned;
+                }
+                self.slashing_records.insert(&source_id, &updated_records);
+            }
+
+            self.env().emit_event(SourceSlashed {
+                source_id,
+                severity,
+                amount_slashed: slash_amount,
+                remaining_stake,
+                reason,
+            });
+
+            Ok(())
+        }
+
+        /// Unban a previously banned source (admin only).
+        #[ink(message)]
+        pub fn unban_source(&mut self, source_id: String) -> Result<(), OracleError> {
+            self.ensure_admin()?;
+            self.banned_sources.insert(&source_id, &0);
+            self.env().emit_event(SourceUnbanned {
+                source_id,
+                admin: self.env().caller(),
+            });
+            Ok(())
+        }
+
+        /// Update slashing configuration parameters (admin only).
+        #[ink(message)]
+        pub fn set_slashing_config(
+            &mut self,
+            config: SlashingConfig,
+        ) -> Result<(), OracleError> {
+            self.ensure_admin()?;
+            self.slashing_config = config;
+            Ok(())
+        }
+
+        /// Get the current slashing configuration.
+        #[ink(message)]
+        pub fn get_slashing_config(&self) -> SlashingConfig {
+            self.slashing_config.clone()
+        }
+
+        /// Get slashing records for a source.
+        #[ink(message)]
+        pub fn get_slashing_records(&self, source_id: String) -> Vec<SlashingRecord> {
+            self.slashing_records.get(&source_id).unwrap_or_default()
+        }
+
+        /// Get the complete status of a source including slashing info.
+        #[ink(message)]
+        pub fn get_source_status(&self, source_id: String) -> Option<SourceStatus> {
+            let reputation = self.source_reputations.get(&source_id)?;
+            let stake = self.source_stakes.get(&source_id).unwrap_or(0);
+            let is_active = self
+                .oracle_sources
+                .get(&source_id)
+                .map(|s| s.is_active)
+                .unwrap_or(false);
+            let ban_expires_at = self.banned_sources.get(&source_id).unwrap_or(0);
+            let is_banned = if ban_expires_at > 0 {
+                self.env().block_number() < ban_expires_at
+            } else {
+                false
+            };
+            let total_slashes = self.slashing_counts.get(&source_id).unwrap_or(0);
+            let total_amount_slashed = self.slashed_amounts.get(&source_id).unwrap_or(0);
+
+            Some(SourceStatus {
+                reputation,
+                stake,
+                is_active,
+                is_banned,
+                ban_expires_at,
+                total_slashes,
+                total_amount_slashed,
+            })
+        }
+
+        /// Get slashing summary for a source.
+        #[ink(message)]
+        pub fn get_slashing_summary(&self, source_id: String) -> SlashingSummary {
+            let recent_slashes = self.slashing_records.get(&source_id).unwrap_or_default();
+            let total_slashes = self.slashing_counts.get(&source_id).unwrap_or(0);
+            let total_amount_slashed = self.slashed_amounts.get(&source_id).unwrap_or(0);
+
+            SlashingSummary {
+                recent_slashes,
+                total_slashes,
+                total_amount_slashed,
+            }
         }
 
         /// Detect if a new valuation is an anomaly based on historical data
