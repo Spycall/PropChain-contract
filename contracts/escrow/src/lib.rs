@@ -98,6 +98,15 @@ mod propchain_escrow {
     }
 
     #[ink(event)]
+    pub struct FundsPartiallyReleased {
+        #[ink(topic)]
+        escrow_id: u64,
+        amount: u128,
+        recipient: AccountId,
+        remaining: u128,
+    }
+
+    #[ink(event)]
     pub struct FundsRefunded {
         #[ink(topic)]
         escrow_id: u64,
@@ -287,6 +296,7 @@ mod propchain_escrow {
                 release_time_lock,
                 participants: participants.clone(),
                 jurisdiction,
+                total_released: 0,
             };
 
             self.escrows.insert(&escrow_id, &escrow_data);
@@ -483,6 +493,79 @@ mod propchain_escrow {
                     escrow_id,
                     amount: escrow.deposited_amount,
                     recipient: escrow.seller,
+                });
+
+                Ok(())
+            })
+        }
+
+        /// Release a partial amount from escrow to the seller.
+        /// The escrow remains active for any remaining balance.
+        #[ink(message)]
+        pub fn release_funds_partial(
+            &mut self,
+            escrow_id: u64,
+            amount: u128,
+        ) -> Result<(), Error> {
+            non_reentrant!(self, {
+                let caller = self.env().caller();
+                let mut escrow = self.escrows.get(&escrow_id).ok_or(Error::EscrowNotFound)?;
+
+                if escrow.status != EscrowStatus::Active {
+                    return Err(Error::InvalidStatus);
+                }
+
+                if amount == 0 || amount > escrow.deposited_amount.saturating_sub(escrow.total_released) {
+                    return Err(Error::InsufficientFunds);
+                }
+
+                // Check for active dispute
+                if let Some(dispute) = self.disputes.get(&escrow_id) {
+                    if !dispute.resolved {
+                        return Err(Error::DisputeActive);
+                    }
+                }
+
+                // Check time lock
+                if let Some(time_lock) = escrow.release_time_lock {
+                    if self.env().block_timestamp() < time_lock {
+                        return Err(Error::TimeLockActive);
+                    }
+                }
+
+                // Check multi-sig threshold
+                if !self.check_signature_threshold(escrow_id, ApprovalType::Release)? {
+                    return Err(Error::SignatureThresholdNotMet);
+                }
+
+                // Transfer the partial amount
+                if self.env().transfer(escrow.seller, amount).is_err() {
+                    return Err(Error::InsufficientFunds);
+                }
+
+                escrow.total_released = escrow.total_released.saturating_add(amount);
+
+                // If fully released, mark as Released
+                if escrow.total_released >= escrow.deposited_amount {
+                    escrow.status = EscrowStatus::Released;
+                }
+
+                self.escrows.insert(&escrow_id, &escrow);
+
+                let remaining = escrow.deposited_amount.saturating_sub(escrow.total_released);
+
+                self.add_audit_entry(
+                    escrow_id,
+                    caller,
+                    "FundsPartiallyReleased".to_string(),
+                    format!("Amount: {} to seller, remaining: {}", amount, remaining),
+                );
+
+                self.env().emit_event(FundsPartiallyReleased {
+                    escrow_id,
+                    amount,
+                    recipient: escrow.seller,
+                    remaining,
                 });
 
                 Ok(())
