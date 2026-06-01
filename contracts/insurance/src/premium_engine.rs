@@ -274,10 +274,10 @@ fn calculate_deductible(
     modifiers: &PremiumModifiers,
 ) -> u128 {
     // Base deductible: 5% of coverage
-    let base_deductible_rate = 500; // 5% in basis points
+    let base_deductible_rate: u32 = 500; // 5% in basis points
 
     // Adjust based on risk (higher risk = higher deductible)
-    let risk_adjustment = match assessment.overall_risk_score {
+    let risk_adjustment: u32 = match assessment.overall_risk_score {
         0..=20 => 200,     // Very high risk - 20% deductible
         21..=40 => 150,    // High risk - 15%
         41..=60 => 100,    // Medium risk - 10%
@@ -288,8 +288,9 @@ fn calculate_deductible(
     let deductible_rate = base_deductible_rate.saturating_add(risk_adjustment);
 
     // Apply safety feature reduction
+    let reduction: u32 = 50;
     let final_rate = if modifiers.has_safety_features {
-        deductible_rate.saturating_sub(50) // Reduce by 5%
+        deductible_rate.saturating_sub(reduction)
     } else {
         deductible_rate
     };
