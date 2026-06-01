@@ -96,6 +96,14 @@ mod propchain_oracle {
         multisig_proposals: Mapping<u64, MultiSigProposal>,
         /// Counter for generating unique proposal ids.
         multisig_proposal_counter: u64,
+
+        // ── Fallback Mechanism (Issue #220) ────────────────────────────────────
+        /// Fallback configuration
+        fallback_config: FallbackConfig,
+        /// Ordered list of fallback source IDs
+        fallback_source_ids: Vec<String>,
+        /// Fallback sources: source_id -> FallbackSource
+        fallback_sources: Mapping<String, FallbackSource>,
     }
 
     /// A pending multi-sig proposal for a critical oracle operation.
@@ -181,6 +189,41 @@ mod propchain_oracle {
         proposal_id: u64,
     }
 
+    // ── Fallback Mechanism Events (Issue #220) ─────────────────────────────
+
+    /// Emitted when the fallback configuration is updated.
+    #[ink(event)]
+    pub struct FallbackConfigUpdated {
+        enabled: bool,
+        fallback_delay_blocks: u32,
+        max_fallback_attempts: u32,
+    }
+
+    /// Emitted when a fallback source is added.
+    #[ink(event)]
+    pub struct FallbackSourceAdded {
+        #[ink(topic)]
+        source_id: String,
+        priority: u32,
+    }
+
+    /// Emitted when a fallback source is removed.
+    #[ink(event)]
+    pub struct FallbackSourceRemoved {
+        #[ink(topic)]
+        source_id: String,
+    }
+
+    /// Emitted when fallback is triggered for a primary source failure.
+    #[ink(event)]
+    pub struct FallbackTriggered {
+        #[ink(topic)]
+        primary_source_id: String,
+        fallback_source_id: String,
+        property_id: u64,
+        attempts: u32,
+    }
+
     include!("types.rs");
 
     impl PropertyValuationOracle {
@@ -231,6 +274,10 @@ mod propchain_oracle {
                 multisig_threshold: 1,
                 multisig_proposals: Mapping::default(),
                 multisig_proposal_counter: 0,
+                // Fallback mechanism defaults (Issue #220)
+                fallback_config: FallbackConfig::default(),
+                fallback_source_ids: Vec::new(),
+                fallback_sources: Mapping::default(),
             }
         }
 
@@ -745,6 +792,177 @@ mod propchain_oracle {
         #[ink(message)]
         pub fn get_ai_valuation_contract(&self) -> Option<AccountId> {
             self.ai_valuation_contract
+        }
+
+        // ── Fallback Mechanism API (Issue #220) ───────────────────────────────
+
+        /// Update the fallback configuration (admin only).
+        #[ink(message)]
+        pub fn set_fallback_config(&mut self, config: FallbackConfig) -> Result<(), OracleError> {
+            self.ensure_admin()?;
+            self.fallback_config = config;
+            self.env().emit_event(FallbackConfigUpdated {
+                enabled: self.fallback_config.enabled,
+                fallback_delay_blocks: self.fallback_config.fallback_delay_blocks,
+                max_fallback_attempts: self.fallback_config.max_fallback_attempts,
+            });
+            Ok(())
+        }
+
+        /// Get the current fallback configuration.
+        #[ink(message)]
+        pub fn get_fallback_config(&self) -> FallbackConfig {
+            self.fallback_config.clone()
+        }
+
+        /// Add a fallback oracle source (admin only).
+        #[ink(message)]
+        pub fn add_fallback_source(&mut self, source: FallbackSource) -> Result<(), OracleError> {
+            self.ensure_admin()?;
+
+            if self.fallback_sources.get(&source.id).is_some() {
+                return Err(OracleError::AlreadyExists);
+            }
+
+            self.fallback_sources.insert(&source.id, &source);
+
+            if !self.fallback_source_ids.contains(&source.id) {
+                self.fallback_source_ids.push(source.id.clone());
+                self.fallback_source_ids
+                    .sort_by(|a, b| {
+                        let pa = self
+                            .fallback_sources
+                            .get(a)
+                            .map(|s| s.priority)
+                            .unwrap_or(999);
+                        let pb = self
+                            .fallback_sources
+                            .get(b)
+                            .map(|s| s.priority)
+                            .unwrap_or(999);
+                        pa.cmp(&pb)
+                    });
+            }
+
+            self.env().emit_event(FallbackSourceAdded {
+                source_id: source.id,
+                priority: source.priority,
+            });
+
+            Ok(())
+        }
+
+        /// Remove a fallback source (admin only).
+        #[ink(message)]
+        pub fn remove_fallback_source(&mut self, source_id: String) -> Result<(), OracleError> {
+            self.ensure_admin()?;
+
+            if self.fallback_sources.get(&source_id).is_none() {
+                return Err(OracleError::OracleSourceNotFound);
+            }
+
+            self.fallback_sources.remove(&source_id);
+            self.fallback_source_ids.retain(|id| id != &source_id);
+
+            self.env().emit_event(FallbackSourceRemoved { source_id });
+
+            Ok(())
+        }
+
+        /// Query the oracle with automatic fallback support.
+        /// If the primary source fails, fallback sources are tried in priority order.
+        #[ink(message)]
+        pub fn query_with_fallback(
+            &mut self,
+            property_id: u64,
+        ) -> Result<FallbackQueryResult, OracleError> {
+            let mut attempts = 0u32;
+            let max_attempts = self.fallback_config.max_fallback_attempts;
+
+            // First try primary sources
+            match self.collect_prices_from_sources(property_id) {
+                Ok(prices) if !prices.is_empty() => {
+                    let price = self.aggregate_prices(&prices)?;
+                    return Ok(FallbackQueryResult {
+                        success: true,
+                        price,
+                        source_id: "primary".to_string(),
+                        attempts: 0,
+                        timestamp: self.env().block_timestamp(),
+                        error: String::new(),
+                    });
+                }
+                _ => {}
+            }
+
+            // Try fallback sources in priority order
+            for source_id in &self.fallback_source_ids {
+                if attempts >= max_attempts {
+                    break;
+                }
+
+                if let Some(source) = self.fallback_sources.get(source_id) {
+                    if !source.active {
+                        continue;
+                    }
+
+                    attempts += 1;
+
+                    match self.get_latest_manual_price(property_id) {
+                        Ok(price_data) => {
+                            let mut updated = source.clone();
+                            updated.success_count = source.success_count.saturating_add(1);
+                            self.fallback_sources.insert(source_id, &updated);
+
+                            self.env().emit_event(FallbackTriggered {
+                                primary_source_id: "primary".to_string(),
+                                fallback_source_id: source_id.clone(),
+                                property_id,
+                                attempts,
+                            });
+
+                            return Ok(FallbackQueryResult {
+                                success: true,
+                                price: price_data.price,
+                                source_id: source_id.clone(),
+                                attempts,
+                                timestamp: self.env().block_timestamp(),
+                                error: String::new(),
+                            });
+                        }
+                        Err(_) => {
+                            let mut updated = source.clone();
+                            updated.failure_count = source.failure_count.saturating_add(1);
+                            self.fallback_sources.insert(source_id, &updated);
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            Ok(FallbackQueryResult {
+                success: false,
+                price: 0,
+                source_id: String::new(),
+                attempts,
+                timestamp: self.env().block_timestamp(),
+                error: "All fallback sources exhausted".to_string(),
+            })
+        }
+
+        /// Get all registered fallback sources.
+        #[ink(message)]
+        pub fn get_fallback_sources(&self) -> Vec<FallbackSource> {
+            self.fallback_source_ids
+                .iter()
+                .filter_map(|id| self.fallback_sources.get(id))
+                .collect()
+        }
+
+        /// Get a specific fallback source by ID.
+        #[ink(message)]
+        pub fn get_fallback_source(&self, source_id: String) -> Option<FallbackSource> {
+            self.fallback_sources.get(&source_id)
         }
 
         /// Add oracle source (admin only)
