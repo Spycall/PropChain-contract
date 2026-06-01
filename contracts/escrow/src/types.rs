@@ -164,43 +164,35 @@ pub struct LargeTransferRequest {
     pub status: LargeTransferStatus,
 }
 
-// ── Escrow Participant Rating Types (Issue #216) ────────────────────────────
+// ── Escrow Analytics Types (Issue #218) ─────────────────────────────────────
 
-/// Rating score given to a participant in an escrow transaction.
-/// Score range: 1 (worst) to 5 (best).
+/// Aggregated escrow analytics data for dashboard display.
 #[derive(Debug, Clone, PartialEq, Eq, scale::Encode, scale::Decode)]
 #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
 #[derive(ink::storage::traits::StorageLayout)]
-pub struct ParticipantRating {
-    /// The account that received the rating
-    pub participant: AccountId,
-    /// The account that gave the rating
-    pub rater: AccountId,
-    /// The escrow this rating is for
-    pub escrow_id: u64,
-    /// Rating score (1-5)
-    pub score: u8,
-    /// Optional comment
-    pub comment: Option<String>,
-    /// Block timestamp when rating was given
-    pub rated_at: u64,
-}
-
-/// Aggregated rating summary for a participant.
-#[derive(Debug, Clone, PartialEq, Eq, scale::Encode, scale::Decode)]
-#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
-#[derive(ink::storage::traits::StorageLayout)]
-pub struct RatingSummary {
-    /// Total number of ratings received
-    pub total_ratings: u32,
-    /// Average score (in basis points, e.g. 450 = 4.5)
-    pub average_score_bps: u32,
-    /// Breakdown: count per score (index 0 = score 1, index 4 = score 5)
-    pub score_distribution: [u32; 5],
-    /// Number of transactions completed as buyer
-    pub transactions_as_buyer: u32,
-    /// Number of transactions completed as seller
-    pub transactions_as_seller: u32,
-    /// Reliability score (0-1000) based on rating consistency
-    pub reliability_score: u32,
+pub struct EscrowAnalytics {
+    /// Total number of escrows created
+    pub total_created: u64,
+    /// Total number of escrows that have been released
+    pub total_released: u64,
+    /// Total number of escrows that have been refunded
+    pub total_refunded: u64,
+    /// Total number of escrows that have been disputed
+    pub total_disputed: u64,
+    /// Total number of escrows currently active
+    pub total_active: u64,
+    /// Total volume of all escrows (sum of amounts)
+    pub total_volume: u128,
+    /// Total volume of released escrows
+    pub total_released_volume: u128,
+    /// Total fees collected across all escrows
+    pub total_fees_collected: u128,
+    /// Average escrow amount
+    pub average_escrow_amount: u128,
+    /// Average dispute resolution time (in blocks)
+    pub average_dispute_resolution_time: u64,
+    /// Total number of disputes that have been resolved
+    pub total_disputes_resolved: u64,
+    /// Number of unique participants (buyers + sellers)
+    pub unique_participants: u64,
 }
