@@ -76,6 +76,23 @@ mod governance {
         pub admin: AccountId,
     }
 
+    /// Emitted when auto-execute is toggled for a proposal.
+    #[ink(event)]
+    pub struct AutoExecuteToggled {
+        #[ink(topic)]
+        pub proposal_id: u64,
+        pub auto_execute: bool,
+        pub toggled_by: AccountId,
+    }
+
+    /// Emitted when a proposal is automatically executed.
+    #[ink(event)]
+    pub struct AutoExecuted {
+        #[ink(topic)]
+        pub proposal_id: u64,
+        pub executed_at: u64,
+    }
+
     // =========================================================================
     // Storage
     // =========================================================================
@@ -101,6 +118,11 @@ mod governance {
         delegated_power: Mapping<AccountId, u32>,
         /// Delegation expiry: (delegator, delegate) -> expiry block
         delegation_expiry: Mapping<(AccountId, AccountId), u64>,
+        // ── Proposal Automation (Issue #232) ──────────────────────────────────
+        /// Whether a proposal has auto-execute enabled: proposal_id -> bool
+        auto_execute_enabled: Mapping<u64, bool>,
+        /// Global automation toggle (admin can pause all auto-execution)
+        automation_paused: bool,
     }
 
     // =========================================================================
@@ -140,6 +162,8 @@ mod governance {
                 governance_delegations: Mapping::default(),
                 delegated_power: Mapping::default(),
                 delegation_expiry: Mapping::default(),
+                auto_execute_enabled: Mapping::default(),
+                automation_paused: false,
             }
         }
 
@@ -500,6 +524,124 @@ mod governance {
                 proposal_id,
                 executed_at: now,
             });
+
+            Ok(())
+        }
+
+        // ── Proposal Automation (Issue #232) ─────────────────────────────────
+
+        /// Toggle auto-execute for a proposal. Only the proposer or admin may toggle.
+        #[ink(message)]
+        pub fn set_auto_execute(
+            &mut self,
+            proposal_id: u64,
+            auto_execute: bool,
+        ) -> Result<(), Error> {
+            let caller = self.env().caller();
+            let proposal = self
+                .proposals
+                .get(proposal_id)
+                .ok_or(Error::ProposalNotFound)?;
+
+            if caller != proposal.proposer && caller != self.admin {
+                return Err(Error::Unauthorized);
+            }
+
+            self.auto_execute_enabled
+                .insert(&proposal_id, &auto_execute);
+
+            self.env().emit_event(AutoExecuteToggled {
+                proposal_id,
+                auto_execute,
+                toggled_by: caller,
+            });
+
+            Ok(())
+        }
+
+        /// Pause or resume all auto-execution globally. Admin only.
+        #[ink(message)]
+        pub fn set_automation_paused(&mut self, paused: bool) -> Result<(), Error> {
+            self.ensure_admin()?;
+            self.automation_paused = paused;
+            Ok(())
+        }
+
+        /// Returns whether auto-execute is enabled for a proposal.
+        #[ink(message)]
+        pub fn is_auto_execute_enabled(&self, proposal_id: u64) -> bool {
+            self.auto_execute_enabled.get(&proposal_id).unwrap_or(false)
+        }
+
+        /// Returns whether automation is globally paused.
+        #[ink(message)]
+        pub fn is_automation_paused(&self) -> bool {
+            self.automation_paused
+        }
+
+        /// Attempt to auto-execute a proposal when timelock expires.
+        /// Called automatically when a vote reaches threshold if auto-execute is enabled.
+        #[ink(message)]
+        pub fn try_auto_execute(&mut self, proposal_id: u64) -> Result<(), Error> {
+            let mut proposal = self
+                .proposals
+                .get(proposal_id)
+                .ok_or(Error::ProposalNotFound)?;
+
+            if proposal.status != ProposalStatus::Approved {
+                return Err(Error::ProposalClosed);
+            }
+
+            if self.automation_paused {
+                return Err(Error::ProposalClosed);
+            }
+
+            if !self.auto_execute_enabled.get(&proposal_id).unwrap_or(false) {
+                return Err(Error::ProposalClosed);
+            }
+
+            let now = self.env().block_number() as u64;
+            if now < proposal.timelock_until {
+                return Err(Error::TimelockActive);
+            }
+
+            proposal.status = ProposalStatus::Executed;
+            proposal.executed_at = now;
+            self.proposals.insert(proposal_id, &proposal);
+
+            self.env().emit_event(ProposalExecuted {
+                proposal_id,
+                executed_at: now,
+            });
+            self.env().emit_event(AutoExecuted {
+                proposal_id,
+                executed_at: now,
+            });
+
+            Ok(())
+        }
+
+        /// Enhanced vote that auto-executes if conditions are met.
+        /// Replaces manual vote + manual execute flow when auto-execute is enabled.
+        #[ink(message)]
+        pub fn vote_and_auto_execute(
+            &mut self,
+            proposal_id: u64,
+            support: bool,
+        ) -> Result<(), Error> {
+            self.vote(proposal_id, support)?;
+
+            // If auto-execute is enabled and timelock has passed, execute
+            let proposal = self.proposals.get(proposal_id).ok_or(Error::ProposalNotFound)?;
+            if proposal.status == ProposalStatus::Approved {
+                let now = self.env().block_number() as u64;
+                if now >= proposal.timelock_until
+                    && self.auto_execute_enabled.get(&proposal_id).unwrap_or(false)
+                    && !self.automation_paused
+                {
+                    self.try_auto_execute(proposal_id)?;
+                }
+            }
 
             Ok(())
         }
