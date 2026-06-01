@@ -77,6 +77,12 @@ mod propchain_oracle {
         /// Maximum batch size for batch operations
         max_batch_size: u32,
 
+        // ── Update Frequency Control (Issue #225) ────────────────────────────
+        /// Minimum interval (in blocks) between two updates for the same source
+        min_update_interval_blocks: u64,
+        /// Last update time per source: source_id -> block_number
+        last_source_update: Mapping<String, u64>,
+
         // ── Circuit Breaker (Issue #316) ──────────────────────────────────────
         /// When true, valuation updates that exceed `volatility_threshold` are
         /// automatically blocked until an admin resets the breaker.
@@ -181,6 +187,25 @@ mod propchain_oracle {
         proposal_id: u64,
     }
 
+    // ── Update Frequency Events (Issue #225) ────────────────────────────────
+
+    /// Emitted when the minimum update interval is changed.
+    #[ink(event)]
+    pub struct MinUpdateIntervalUpdated {
+        old_interval: u64,
+        new_interval: u64,
+        updated_by: AccountId,
+    }
+
+    /// Emitted when an update is rejected due to frequency control.
+    #[ink(event)]
+    pub struct UpdateThrottled {
+        source_id: String,
+        last_update: u64,
+        current_block: u64,
+        min_interval: u64,
+    }
+
     include!("types.rs");
 
     impl PropertyValuationOracle {
@@ -222,6 +247,8 @@ mod propchain_oracle {
                 request_id_counter: 0,
                 ai_valuation_contract: None,
                 max_batch_size: 50,
+                min_update_interval_blocks: 6, // ~36 seconds at 6s blocks
+                last_source_update: Mapping::default(),
                 // Circuit breaker defaults (Issue #316)
                 circuit_breaker_active: false,
                 volatility_threshold: 20, // 20% default threshold
@@ -496,6 +523,34 @@ mod propchain_oracle {
         #[ink(message)]
         pub fn get_multisig_proposal(&self, proposal_id: u64) -> Option<MultiSigProposal> {
             self.multisig_proposals.get(&proposal_id)
+        }
+
+        // ── Update Frequency API (Issue #225) ────────────────────────────────
+
+        /// Returns the minimum interval (in blocks) between source updates.
+        #[ink(message)]
+        pub fn get_min_update_interval(&self) -> u64 {
+            self.min_update_interval_blocks
+        }
+
+        /// Returns the last update block for a source.
+        #[ink(message)]
+        pub fn get_source_last_update(&self, source_id: String) -> u64 {
+            self.last_source_update.get(&source_id).unwrap_or(0)
+        }
+
+        /// Admin: set the minimum update interval.
+        #[ink(message)]
+        pub fn set_min_update_interval(&mut self, interval_blocks: u64) -> Result<(), OracleError> {
+            self.ensure_admin()?;
+            let old = self.min_update_interval_blocks;
+            self.min_update_interval_blocks = interval_blocks;
+            self.env().emit_event(MinUpdateIntervalUpdated {
+                old_interval: old,
+                new_interval: interval_blocks,
+                updated_by: self.env().caller(),
+            });
+            Ok(())
         }
 
         /// Update property valuation from oracle sources
@@ -825,20 +880,45 @@ mod propchain_oracle {
             Ok(())
         }
 
+        fn enforce_frequency_check(&self, source_id: &str) -> Result<(), OracleError> {
+            if self.min_update_interval_blocks == 0 {
+                return Ok(()); // No frequency limit
+            }
+            let last = self.last_source_update.get(&source_id.to_string()).unwrap_or(0);
+            let current = self.env().block_number() as u64;
+            if last > 0 && current.saturating_sub(last) < self.min_update_interval_blocks {
+                return Err(OracleError::RequestPending);
+            }
+            Ok(())
+        }
+
         fn collect_prices_from_sources(
-            &self,
+            &mut self,
             property_id: u64,
         ) -> Result<Vec<PriceData>, OracleError> {
             let mut prices = Vec::new();
+            let current_block = self.env().block_number() as u64;
 
             for source_id in &self.active_sources {
                 if let Some(source) = self.oracle_sources.get(source_id) {
+                    // Frequency control check
+                    if let Err(e) = self.enforce_frequency_check(source_id) {
+                        self.env().emit_event(UpdateThrottled {
+                            source_id: source_id.clone(),
+                            last_update: self.last_source_update.get(source_id).unwrap_or(0),
+                            current_block,
+                            min_interval: self.min_update_interval_blocks,
+                        });
+                        continue;
+                    }
+
                     // In a real implementation, this would call external price feeds
-                    // For now, we'll simulate price collection
                     match self.get_price_from_source(&source, property_id) {
                         Ok(price_data) => {
                             if self.is_price_fresh(&price_data) {
                                 prices.push(price_data);
+                                // Update last-update timestamp
+                                self.last_source_update.insert(source_id, &current_block);
                             }
                         }
                         Err(_) => continue, // Skip failed sources
