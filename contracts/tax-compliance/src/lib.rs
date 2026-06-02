@@ -11,6 +11,7 @@ mod tax_compliance {
     use super::*;
     mod tax_engine;
     mod jurisdiction_presets;
+    mod tax_strategies;
 
     const BASIS_POINTS_DENOMINATOR: Balance = 10_000;
 
@@ -35,6 +36,12 @@ mod tax_compliance {
             }
         }
     }
+
+    // Re-export tax strategy types
+    pub use tax_strategies::{
+        StrategyType, TaxStrategy, TimingStrategy, TransferStrategy, PortfolioStrategy,
+        EntityStrategy, InstallmentStrategy, CrossBorderStrategy, OptimizationAnalysis,
+    };
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, scale::Encode, scale::Decode)]
     #[cfg_attr(
@@ -1300,6 +1307,128 @@ pub struct TaxDeadlineNotification {
 
             opportunities.sort_by(|left, right| right.estimated_savings.cmp(&left.estimated_savings));
             Ok(opportunities)
+        }
+
+        /// Recommends timing-based optimization strategies for tax-efficient transactions
+        #[ink(message)]
+        pub fn get_timing_optimization_strategy(
+            &self,
+            property_id: u64,
+            jurisdiction: Jurisdiction,
+        ) -> Result<TimingStrategy> {
+            let rule = self.get_active_rule(jurisdiction.code)?;
+            let profile = self.jurisdiction_profiles.get(jurisdiction.code);
+            let now = self.env().block_timestamp();
+            let reporting_period = self.reporting_period(now, rule.reporting_frequency);
+            let record = self.tax_records.get((property_id, jurisdiction.code, reporting_period));
+
+            Ok(tax_strategies::calculate_timing_strategy(rule, profile, record, now))
+        }
+
+        /// Recommends property transfer optimization strategies
+        #[ink(message)]
+        pub fn get_transfer_optimization_strategy(
+            &self,
+            property_id: u64,
+            jurisdiction: Jurisdiction,
+        ) -> Result<TransferStrategy> {
+            let rule = self.get_active_rule(jurisdiction.code)?;
+            let assessment = self
+                .property_assessments
+                .get((property_id, jurisdiction.code))
+                .ok_or(Error::AssessmentNotFound)?;
+
+            Ok(tax_strategies::calculate_transfer_strategy(assessment, rule))
+        }
+
+        /// Recommends portfolio rebalancing strategy for multiple properties
+        #[ink(message)]
+        pub fn get_portfolio_optimization_strategy(
+            &self,
+            total_portfolio_value: Balance,
+            property_count: u32,
+            harvesting_opportunity: Balance,
+        ) -> PortfolioStrategy {
+            tax_strategies::calculate_portfolio_strategy(
+                total_portfolio_value,
+                property_count,
+                harvesting_opportunity,
+            )
+        }
+
+        /// Recommends entity structure optimization
+        #[ink(message)]
+        pub fn get_entity_structure_strategy(
+            &self,
+            property_id: u64,
+            jurisdiction: Jurisdiction,
+        ) -> Result<EntityStrategy> {
+            let rule = self.get_active_rule(jurisdiction.code)?;
+            let assessment = self
+                .property_assessments
+                .get((property_id, jurisdiction.code))
+                .ok_or(Error::AssessmentNotFound)?;
+
+            Ok(tax_strategies::calculate_entity_strategy(
+                rule.rate_basis_points,
+                assessment.assessed_value,
+            ))
+        }
+
+        /// Recommends installment-based transaction structure
+        #[ink(message)]
+        pub fn get_installment_strategy(&self, transaction_amount: Balance) -> InstallmentStrategy {
+            tax_strategies::calculate_installment_strategy(transaction_amount)
+        }
+
+        /// Recommends cross-border transaction optimization
+        #[ink(message)]
+        pub fn get_cross_border_strategy(
+            &self,
+            source_jurisdiction_code: u32,
+            target_jurisdiction_code: u32,
+            transaction_value: Balance,
+        ) -> Result<CrossBorderStrategy> {
+            let source_rule = self.get_active_rule(source_jurisdiction_code)?;
+            let target_rule = self.get_active_rule(target_jurisdiction_code)?;
+
+            Ok(tax_strategies::calculate_cross_border_strategy(
+                source_jurisdiction_code,
+                target_jurisdiction_code,
+                source_rule.rate_basis_points,
+                target_rule.rate_basis_points,
+                transaction_value,
+            ))
+        }
+
+        /// Performs comprehensive analysis of all applicable tax optimization strategies
+        #[ink(message)]
+        pub fn analyze_tax_optimization_strategies(
+            &self,
+            property_id: u64,
+            jurisdiction: Jurisdiction,
+            portfolio_value: Balance,
+            property_count: u32,
+        ) -> Result<OptimizationAnalysis> {
+            let rule = self.get_active_rule(jurisdiction.code)?;
+            let profile = self.jurisdiction_profiles.get(jurisdiction.code);
+            let assessment = self
+                .property_assessments
+                .get((property_id, jurisdiction.code))
+                .ok_or(Error::AssessmentNotFound)?;
+            let now = self.env().block_timestamp();
+            let reporting_period = self.reporting_period(now, rule.reporting_frequency);
+            let record = self.tax_records.get((property_id, jurisdiction.code, reporting_period));
+
+            Ok(tax_strategies::analyze_strategies(
+                rule,
+                profile,
+                assessment,
+                record,
+                portfolio_value,
+                property_count,
+                now,
+            ))
         }
 
         #[ink(message)]
