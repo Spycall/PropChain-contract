@@ -1,5 +1,25 @@
 // Data types for the insurance contract (Issue #101 - extracted from lib.rs)
 // Parametric insurance types added for Issue #249
+// Circuit breaker types added for Issue #494
+// Admin key rotation types added for Issue #496
+
+// =========================================================================
+// CIRCUIT BREAKER TYPES (Issue #494)
+// =========================================================================
+
+/// Configuration parameters for the insurance payout circuit breaker.
+#[derive(
+    Debug, Clone, PartialEq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub struct CircuitBreakerConfig {
+    /// Maximum amount that can be paid out in a single claim (0 = no limit)
+    pub max_single_payout: u128,
+    /// Maximum total payout allowed within one `window_seconds` rolling window per pool
+    pub max_daily_payout: u128,
+    /// Length of the rolling payout-tracking window in seconds (default: 86400 = 1 day)
+    pub window_seconds: u64,
+}
 
 /// The comparison operator used to evaluate oracle data against a trigger threshold.
 #[derive(

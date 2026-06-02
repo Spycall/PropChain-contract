@@ -366,3 +366,371 @@ mod oracle_tests {
         assert!(oracle.pending_requests.get(&3).is_some());
     }
 }
+
+// =========================================================================
+// AUTO-SLASH TESTS (Issue #497)
+// =========================================================================
+
+#[cfg(test)]
+mod auto_slash_tests {
+    use super::*;
+    use crate::propchain_oracle::PropertyValuationOracle;
+    use ink::env::{test, DefaultEnvironment};
+
+    fn setup() -> PropertyValuationOracle {
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        PropertyValuationOracle::new(accounts.alice)
+    }
+
+    fn add_source(oracle: &mut PropertyValuationOracle, id: &str) {
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        oracle
+            .add_oracle_source(OracleSource {
+                id: id.to_string(),
+                source_type: OracleSourceType::Manual,
+                address: accounts.bob,
+                is_active: true,
+                weight: 50,
+                last_updated: 0,
+            })
+            .unwrap();
+        // Give the source some stake
+        oracle.source_stakes.insert(&id.to_string(), &1_000_000);
+        // Give it a reputation
+        oracle
+            .source_reputations
+            .insert(&id.to_string(), &500u32);
+    }
+
+    #[ink::test]
+    fn test_auto_slash_config_defaults() {
+        let oracle = setup();
+        let (on_s, secs, on_d, bps, on_m, cnt) = oracle.get_auto_slash_config();
+        assert!(!on_s);
+        assert_eq!(secs, 3600);
+        assert!(!on_d);
+        assert_eq!(bps, 2000);
+        assert!(!on_m);
+        assert_eq!(cnt, 3);
+    }
+
+    #[ink::test]
+    fn test_set_auto_slash_config() {
+        let mut oracle = setup();
+        assert!(oracle
+            .set_auto_slash_config(true, 1800, true, 1500, true, 5)
+            .is_ok());
+        let (on_s, secs, on_d, bps, on_m, cnt) = oracle.get_auto_slash_config();
+        assert!(on_s);
+        assert_eq!(secs, 1800);
+        assert!(on_d);
+        assert_eq!(bps, 1500);
+        assert!(on_m);
+        assert_eq!(cnt, 5);
+    }
+
+    #[ink::test]
+    fn test_set_auto_slash_config_zero_threshold_fails() {
+        let mut oracle = setup();
+        assert_eq!(
+            oracle.set_auto_slash_config(true, 0, false, 1000, false, 3),
+            Err(OracleError::InvalidParameters)
+        );
+    }
+
+    #[ink::test]
+    fn test_auto_slash_on_staleness() {
+        let mut oracle = setup();
+        add_source(&mut oracle, "stale_src");
+
+        // Enable staleness auto-slash with a very short threshold (1 second)
+        oracle
+            .set_auto_slash_config(true, 1, false, 2000, false, 3)
+            .unwrap();
+
+        // Record the source as having reported at time 0
+        oracle
+            .source_last_report_time
+            .insert(&"stale_src".to_string(), &0u64);
+
+        // Set block timestamp to 100 (> staleness threshold of 1)
+        test::set_block_timestamp::<DefaultEnvironment>(100);
+
+        let stake_before = oracle
+            .source_stakes
+            .get(&"stale_src".to_string())
+            .unwrap_or(0);
+
+        // Trigger auto-slash via run_auto_slash_checks
+        oracle.run_auto_slash_checks(500_000);
+
+        let stake_after = oracle
+            .source_stakes
+            .get(&"stale_src".to_string())
+            .unwrap_or(0);
+
+        // Stake should have decreased
+        assert!(stake_after < stake_before, "Stake should be slashed for staleness");
+    }
+
+    #[ink::test]
+    fn test_auto_slash_on_missed_updates() {
+        let mut oracle = setup();
+        add_source(&mut oracle, "lazy_src");
+
+        // Enable missed-updates auto-slash with threshold of 2
+        oracle
+            .set_auto_slash_config(false, 3600, false, 2000, true, 2)
+            .unwrap();
+
+        // Set missed update counter to 3 (above threshold)
+        oracle
+            .source_missed_updates
+            .insert(&"lazy_src".to_string(), &3u32);
+
+        let stake_before = oracle
+            .source_stakes
+            .get(&"lazy_src".to_string())
+            .unwrap_or(0);
+
+        oracle.run_auto_slash_checks(500_000);
+
+        let stake_after = oracle
+            .source_stakes
+            .get(&"lazy_src".to_string())
+            .unwrap_or(0);
+
+        assert!(stake_after < stake_before, "Stake should be slashed for missed updates");
+
+        // Counter should be reset after slash
+        assert_eq!(
+            oracle
+                .source_missed_updates
+                .get(&"lazy_src".to_string())
+                .unwrap_or(99),
+            0
+        );
+    }
+
+    #[ink::test]
+    fn test_auto_slash_respects_disabled_flags() {
+        let mut oracle = setup();
+        add_source(&mut oracle, "fine_src");
+
+        // All auto-slash disabled
+        oracle
+            .set_auto_slash_config(false, 1, false, 1, false, 1)
+            .unwrap();
+
+        // Give the source a stale last-report time and high missed count
+        oracle
+            .source_last_report_time
+            .insert(&"fine_src".to_string(), &0u64);
+        oracle
+            .source_missed_updates
+            .insert(&"fine_src".to_string(), &100u32);
+        test::set_block_timestamp::<DefaultEnvironment>(99_999);
+
+        let stake_before = oracle
+            .source_stakes
+            .get(&"fine_src".to_string())
+            .unwrap_or(0);
+
+        oracle.run_auto_slash_checks(500_000);
+
+        let stake_after = oracle
+            .source_stakes
+            .get(&"fine_src".to_string())
+            .unwrap_or(0);
+
+        // No slashing should have occurred
+        assert_eq!(stake_before, stake_after, "No slash when all flags disabled");
+    }
+
+    #[ink::test]
+    fn test_source_last_report_time_initially_zero() {
+        let oracle = setup();
+        assert_eq!(
+            oracle.get_source_last_report_time("nonexistent".to_string()),
+            0
+        );
+    }
+
+    #[ink::test]
+    fn test_source_missed_updates_initially_zero() {
+        let oracle = setup();
+        assert_eq!(
+            oracle.get_source_missed_updates("nonexistent".to_string()),
+            0
+        );
+    }
+}
+
+// =========================================================================
+// MULTI-SIG ORACLE SOURCE MANAGEMENT TESTS (Issue #495)
+// =========================================================================
+
+#[cfg(test)]
+mod oracle_source_multisig_tests {
+    use super::*;
+    use crate::propchain_oracle::PropertyValuationOracle;
+    use ink::env::{test, DefaultEnvironment};
+
+    fn setup_with_signers() -> PropertyValuationOracle {
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        let mut oracle = PropertyValuationOracle::new(accounts.alice);
+        // Register two signers
+        oracle.add_multisig_signer(accounts.alice).unwrap();
+        oracle.add_multisig_signer(accounts.bob).unwrap();
+        // Require 2 approvals
+        oracle.set_multisig_threshold(2).unwrap();
+        oracle
+    }
+
+    fn sample_source(id: &str) -> OracleSource {
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        OracleSource {
+            id: id.to_string(),
+            source_type: OracleSourceType::Chainlink,
+            address: accounts.charlie,
+            is_active: true,
+            weight: 50,
+            last_updated: 0,
+        }
+    }
+
+    #[ink::test]
+    fn test_single_admin_cannot_add_source_without_multisig() {
+        let mut oracle = setup_with_signers();
+        // Propose as alice (1 of 2 approvals) — should NOT be executed yet
+        let proposal_id = oracle
+            .propose_add_oracle_source(sample_source("chainlink_1"))
+            .unwrap();
+
+        // Source should not be active yet
+        assert!(
+            !oracle.active_sources.contains(&"chainlink_1".to_string()),
+            "Source should not be added until threshold reached"
+        );
+
+        let prop = oracle.get_source_proposal(proposal_id).unwrap();
+        assert!(!prop.executed);
+        assert_eq!(prop.approvals.len(), 1);
+    }
+
+    #[ink::test]
+    fn test_multisig_approval_executes_source_addition() {
+        let mut oracle = setup_with_signers();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+
+        // Alice proposes
+        let proposal_id = oracle
+            .propose_add_oracle_source(sample_source("chainlink_2"))
+            .unwrap();
+
+        // Bob approves — threshold reached
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        let executed = oracle.approve_source_proposal(proposal_id).unwrap();
+        assert!(executed, "Proposal should execute when threshold reached");
+
+        // Source should now be active
+        assert!(
+            oracle.active_sources.contains(&"chainlink_2".to_string()),
+            "Source should be added after threshold reached"
+        );
+
+        let prop = oracle.get_source_proposal(proposal_id).unwrap();
+        assert!(prop.executed);
+    }
+
+    #[ink::test]
+    fn test_multisig_approval_executes_source_removal() {
+        let mut oracle = setup_with_signers();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+
+        // First add the source directly (admin bypass with no signers)
+        oracle
+            .add_oracle_source(sample_source("pyth_1"))
+            .unwrap();
+        assert!(oracle.active_sources.contains(&"pyth_1".to_string()));
+
+        // Propose removal
+        let proposal_id = oracle
+            .propose_remove_oracle_source("pyth_1".to_string())
+            .unwrap();
+
+        // Bob approves
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        let executed = oracle.approve_source_proposal(proposal_id).unwrap();
+        assert!(executed);
+
+        // Source should be gone
+        assert!(
+            !oracle.active_sources.contains(&"pyth_1".to_string()),
+            "Source should be removed after threshold reached"
+        );
+    }
+
+    #[ink::test]
+    fn test_non_signer_cannot_propose() {
+        let mut oracle = setup_with_signers();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.django);
+        assert_eq!(
+            oracle.propose_add_oracle_source(sample_source("bad_src")),
+            Err(OracleError::Unauthorized)
+        );
+    }
+
+    #[ink::test]
+    fn test_double_approval_fails() {
+        let mut oracle = setup_with_signers();
+        let proposal_id = oracle
+            .propose_add_oracle_source(sample_source("chainlink_3"))
+            .unwrap();
+
+        // Alice tries to approve again
+        assert_eq!(
+            oracle.approve_source_proposal(proposal_id),
+            Err(OracleError::AlreadyExists)
+        );
+    }
+
+    #[ink::test]
+    fn test_approve_executed_proposal_fails() {
+        let mut oracle = setup_with_signers();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+
+        let proposal_id = oracle
+            .propose_add_oracle_source(sample_source("chainlink_4"))
+            .unwrap();
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        oracle.approve_source_proposal(proposal_id).unwrap();
+
+        // Try to approve again after execution
+        assert_eq!(
+            oracle.approve_source_proposal(proposal_id),
+            Err(OracleError::AlreadyExists)
+        );
+    }
+
+    #[ink::test]
+    fn test_no_signers_add_source_immediately() {
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        let mut oracle = PropertyValuationOracle::new(accounts.alice);
+        // No signers registered → immediate execution
+
+        oracle
+            .propose_add_oracle_source(sample_source("instant_src"))
+            .unwrap();
+
+        assert!(
+            oracle.active_sources.contains(&"instant_src".to_string()),
+            "Source added immediately when no signers configured"
+        );
+    }
+}

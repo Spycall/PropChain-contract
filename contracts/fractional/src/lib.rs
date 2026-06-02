@@ -4,6 +4,7 @@
 mod fractional {
     use ink::prelude::vec::Vec;
     use ink::storage::Mapping;
+    use propchain_traits;
 
     #[derive(
         Debug,
@@ -117,6 +118,12 @@ mod fractional {
         SlippageExceeded,
         InsufficientLiquidity,
         InsufficientLpShares,
+        // Admin key rotation (Issue #496)
+        KeyRotationCooldown,
+        KeyRotationExpired,
+        NoPendingRotation,
+        RotationUnauthorized,
+        RequestExpired,
     }
 
     /// Emitted when an owner lists shares for sale
@@ -192,6 +199,32 @@ mod fractional {
         new_spot_price: u128,
     }
 
+    // ── Admin Key Rotation Events (Issue #496) ────────────────────────────────
+
+    #[ink(event)]
+    pub struct AdminRotationRequested {
+        #[ink(topic)]
+        old_admin: AccountId,
+        #[ink(topic)]
+        new_admin: AccountId,
+        effective_at_block: u32,
+    }
+
+    #[ink(event)]
+    pub struct AdminRotationConfirmed {
+        #[ink(topic)]
+        old_admin: AccountId,
+        #[ink(topic)]
+        new_admin: AccountId,
+    }
+
+    #[ink(event)]
+    pub struct AdminRotationCancelled {
+        #[ink(topic)]
+        old_admin: AccountId,
+        cancelled_by: AccountId,
+    }
+
     #[ink(storage)]
     pub struct Fractional {
         last_prices: Mapping<u64, u128>,
@@ -205,6 +238,10 @@ mod fractional {
         amm_pools: Mapping<u64, AmmPool>,
         /// LP token balances per (provider, token_id)
         lp_balances: Mapping<(AccountId, u64), u128>,
+        /// Contract administrator (Issue #496)
+        admin: AccountId,
+        /// Pending admin key rotation request (Issue #496)
+        pending_admin_rotation: Option<propchain_traits::KeyRotationRequest>,
     }
 
     impl Fractional {
@@ -217,6 +254,8 @@ mod fractional {
                 total_shares: Mapping::default(),
                 amm_pools: Mapping::default(),
                 lp_balances: Mapping::default(),
+                admin: Self::env().caller(),
+                pending_admin_rotation: None,
             }
         }
     }
@@ -231,6 +270,7 @@ mod fractional {
         #[ink(message)]
         pub fn set_last_price(&mut self, token_id: u64, price_per_share: u128) {
             self.last_prices.insert(token_id, &price_per_share);
+        }            self.last_prices.insert(token_id, &price_per_share);
         }
 
         #[ink(message)]
@@ -770,6 +810,122 @@ mod fractional {
             }
             x
         }
+
+        // ── Admin Key Rotation (Issue #496) ──────────────────────────────────
+
+        /// Get the contract admin address.
+        #[ink(message)]
+        pub fn get_admin(&self) -> AccountId {
+            self.admin
+        }
+
+        /// Initiate two-step admin rotation with timelock cooldown.
+        ///
+        /// Only the current admin may call this. The nominated `new_admin` must
+        /// confirm after `KEY_ROTATION_COOLDOWN_BLOCKS` blocks have elapsed.
+        #[ink(message)]
+        pub fn request_admin_rotation(
+            &mut self,
+            new_admin: AccountId,
+        ) -> Result<(), FractionalError> {
+            let caller = self.env().caller();
+            if caller != self.admin {
+                return Err(FractionalError::Unauthorized);
+            }
+            if self.pending_admin_rotation.is_some() {
+                return Err(FractionalError::KeyRotationCooldown);
+            }
+
+            let block = self.env().block_number();
+            let effective_at = block
+                .saturating_add(propchain_traits::constants::KEY_ROTATION_COOLDOWN_BLOCKS);
+
+            self.pending_admin_rotation = Some(propchain_traits::KeyRotationRequest {
+                old_account: caller,
+                new_account: new_admin,
+                requested_at: block,
+                effective_at,
+                confirmed: false,
+            });
+
+            self.env().emit_event(AdminRotationRequested {
+                old_admin: caller,
+                new_admin,
+                effective_at_block: effective_at,
+            });
+            Ok(())
+        }
+
+        /// Confirm a pending admin rotation after the cooldown period.
+        ///
+        /// Must be called by the nominated new admin.
+        #[ink(message)]
+        pub fn confirm_admin_rotation(&mut self) -> Result<(), FractionalError> {
+            let caller = self.env().caller();
+            let block = self.env().block_number();
+
+            let request = self
+                .pending_admin_rotation
+                .as_ref()
+                .ok_or(FractionalError::NoPendingRotation)?;
+
+            if request.new_account != caller {
+                return Err(FractionalError::RotationUnauthorized);
+            }
+            if block < request.effective_at {
+                return Err(FractionalError::KeyRotationCooldown);
+            }
+            let expiry = request
+                .effective_at
+                .saturating_add(propchain_traits::constants::KEY_ROTATION_EXPIRY_BLOCKS);
+            if block > expiry {
+                self.pending_admin_rotation = None;
+                return Err(FractionalError::RequestExpired);
+            }
+
+            let old_admin = request.old_account;
+            self.admin = caller;
+            self.pending_admin_rotation = None;
+
+            self.env().emit_event(AdminRotationConfirmed {
+                old_admin,
+                new_admin: caller,
+            });
+            Ok(())
+        }
+
+        /// Cancel a pending admin rotation.
+        ///
+        /// Either the current admin or the nominated new admin may cancel.
+        #[ink(message)]
+        pub fn cancel_admin_rotation(&mut self) -> Result<(), FractionalError> {
+            let caller = self.env().caller();
+            let request = self
+                .pending_admin_rotation
+                .as_ref()
+                .ok_or(FractionalError::NoPendingRotation)?;
+
+            if caller != request.old_account && caller != request.new_account {
+                return Err(FractionalError::RotationUnauthorized);
+            }
+
+            let old_admin = request.old_account;
+            self.pending_admin_rotation = None;
+
+            self.env().emit_event(AdminRotationCancelled {
+                old_admin,
+                cancelled_by: caller,
+            });
+            Ok(())
+        }
+
+        /// Get the pending admin rotation request, if any.
+        #[ink(message)]
+        pub fn get_pending_admin_rotation(
+            &self,
+        ) -> Option<propchain_traits::KeyRotationRequest> {
+            self.pending_admin_rotation.clone()
+        }
     }
 
     #[cfg(test)]
@@ -1028,3 +1184,103 @@ mod fractional {
         }
     }
 }
+
+    // =========================================================================
+    // ADMIN KEY ROTATION TESTS (Issue #496) — Fractional
+    // =========================================================================
+
+    #[cfg(test)]
+    mod fractional_admin_rotation_tests {
+        use super::*;
+        use ink::env::{test, DefaultEnvironment};
+
+        fn setup() -> Fractional {
+            let accounts = test::default_accounts::<DefaultEnvironment>();
+            test::set_caller::<DefaultEnvironment>(accounts.alice);
+            Fractional::new()
+        }
+
+        #[ink::test]
+        fn test_constructor_sets_caller_as_admin() {
+            let contract = setup();
+            let accounts = test::default_accounts::<DefaultEnvironment>();
+            assert_eq!(contract.get_admin(), accounts.alice);
+        }
+
+        #[ink::test]
+        fn test_admin_can_request_rotation() {
+            let mut contract = setup();
+            let accounts = test::default_accounts::<DefaultEnvironment>();
+            assert!(contract.request_admin_rotation(accounts.bob).is_ok());
+            let pending = contract.get_pending_admin_rotation();
+            assert!(pending.is_some());
+            let req = pending.unwrap();
+            assert_eq!(req.old_account, accounts.alice);
+            assert_eq!(req.new_account, accounts.bob);
+        }
+
+        #[ink::test]
+        fn test_non_admin_cannot_request_rotation() {
+            let mut contract = setup();
+            let accounts = test::default_accounts::<DefaultEnvironment>();
+            test::set_caller::<DefaultEnvironment>(accounts.bob);
+            assert_eq!(
+                contract.request_admin_rotation(accounts.charlie),
+                Err(FractionalError::Unauthorized)
+            );
+        }
+
+        #[ink::test]
+        fn test_rotation_cannot_be_confirmed_before_cooldown() {
+            let mut contract = setup();
+            let accounts = test::default_accounts::<DefaultEnvironment>();
+            contract.request_admin_rotation(accounts.bob).unwrap();
+            test::set_caller::<DefaultEnvironment>(accounts.bob);
+            // Block 0 < effective_at 14_400
+            assert_eq!(
+                contract.confirm_admin_rotation(),
+                Err(FractionalError::KeyRotationCooldown)
+            );
+        }
+
+        #[ink::test]
+        fn test_old_admin_can_cancel_rotation() {
+            let mut contract = setup();
+            let accounts = test::default_accounts::<DefaultEnvironment>();
+            contract.request_admin_rotation(accounts.bob).unwrap();
+            assert!(contract.cancel_admin_rotation().is_ok());
+            assert!(contract.get_pending_admin_rotation().is_none());
+        }
+
+        #[ink::test]
+        fn test_new_admin_can_cancel_rotation() {
+            let mut contract = setup();
+            let accounts = test::default_accounts::<DefaultEnvironment>();
+            contract.request_admin_rotation(accounts.bob).unwrap();
+            test::set_caller::<DefaultEnvironment>(accounts.bob);
+            assert!(contract.cancel_admin_rotation().is_ok());
+        }
+
+        #[ink::test]
+        fn test_unrelated_cannot_cancel() {
+            let mut contract = setup();
+            let accounts = test::default_accounts::<DefaultEnvironment>();
+            contract.request_admin_rotation(accounts.bob).unwrap();
+            test::set_caller::<DefaultEnvironment>(accounts.charlie);
+            assert_eq!(
+                contract.cancel_admin_rotation(),
+                Err(FractionalError::RotationUnauthorized)
+            );
+        }
+
+        #[ink::test]
+        fn test_duplicate_request_fails() {
+            let mut contract = setup();
+            let accounts = test::default_accounts::<DefaultEnvironment>();
+            contract.request_admin_rotation(accounts.bob).unwrap();
+            assert_eq!(
+                contract.request_admin_rotation(accounts.charlie),
+                Err(FractionalError::KeyRotationCooldown)
+            );
+        }
+    }

@@ -4,6 +4,7 @@
 
 use ink::prelude::string::String;
 use ink::prelude::vec::Vec;
+use propchain_traits;
 
 #[ink::contract]
 mod propchain_analytics {
@@ -95,6 +96,47 @@ mod propchain_analytics {
         property_sentiments: ink::storage::Mapping<u64, MarketSentiment>,
         /// Overall aggregated sentiment
         overall_sentiment: MarketSentiment,
+        /// Pending admin key rotation request (Issue #496)
+        pending_admin_rotation: Option<propchain_traits::KeyRotationRequest>,
+    }
+
+    /// Errors for the analytics contract.
+    #[derive(Debug, PartialEq, Eq, scale::Encode, scale::Decode)]
+    #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+    pub enum AnalyticsError {
+        Unauthorized,
+        // Admin key rotation (Issue #496)
+        KeyRotationCooldown,
+        KeyRotationExpired,
+        NoPendingRotation,
+        RotationUnauthorized,
+        RequestExpired,
+    }
+
+    // ── Admin Key Rotation Events (Issue #496) ────────────────────────────────
+
+    #[ink(event)]
+    pub struct AdminRotationRequested {
+        #[ink(topic)]
+        old_admin: AccountId,
+        #[ink(topic)]
+        new_admin: AccountId,
+        effective_at_block: u32,
+    }
+
+    #[ink(event)]
+    pub struct AdminRotationConfirmed {
+        #[ink(topic)]
+        old_admin: AccountId,
+        #[ink(topic)]
+        new_admin: AccountId,
+    }
+
+    #[ink(event)]
+    pub struct AdminRotationCancelled {
+        #[ink(topic)]
+        old_admin: AccountId,
+        cancelled_by: AccountId,
     }
 
     impl AnalyticsDashboard {
@@ -116,6 +158,7 @@ mod propchain_analytics {
                     bear_volume: 0,
                     bull_bear_ratio_bips: 5000,
                 },
+                pending_admin_rotation: None,
             }
         }
 
@@ -147,7 +190,6 @@ mod propchain_analytics {
             self.historical_trends.insert(self.trend_count, &trend);
             self.trend_count += 1;
         }
-
         #[ink(message)]
         pub fn get_historical_trends(&self) -> Vec<MarketTrend> {
             let mut trends = Vec::new();
@@ -200,7 +242,6 @@ mod propchain_analytics {
             bear_volume: u128,
         ) {
             self.ensure_admin(); // Prediction market or admin updates this
-
             let total_volume = bull_volume + bear_volume;
             let ratio = if total_volume > 0 {
                 ((bull_volume * 10000) / total_volume) as u32
@@ -240,6 +281,12 @@ mod propchain_analytics {
             String::from("Use batched operations and limit nested looping over dynamic collections (e.g. vectors). Store large items in Mappings instead of Vecs.")
         }
 
+        /// Get admin address
+        #[ink(message)]
+        pub fn get_admin(&self) -> AccountId {
+            self.admin
+        }
+
         /// Ensure only the admin can modify metrics
         fn ensure_admin(&self) {
             assert_eq!(
@@ -247,6 +294,116 @@ mod propchain_analytics {
                 self.admin,
                 "Unauthorized: Analytics admin only"
             );
+        }
+
+        // ── Admin Key Rotation (Issue #496) ──────────────────────────────────
+
+        /// Initiate two-step admin rotation with timelock cooldown.
+        ///
+        /// Only the current admin may call this. The nominated `new_admin` must
+        /// confirm after `KEY_ROTATION_COOLDOWN_BLOCKS` blocks have elapsed.
+        #[ink(message)]
+        pub fn request_admin_rotation(
+            &mut self,
+            new_admin: AccountId,
+        ) -> Result<(), AnalyticsError> {
+            let caller = self.env().caller();
+            if caller != self.admin {
+                return Err(AnalyticsError::Unauthorized);
+            }
+            if self.pending_admin_rotation.is_some() {
+                return Err(AnalyticsError::KeyRotationCooldown);
+            }
+
+            let block = self.env().block_number();
+            let effective_at = block
+                .saturating_add(propchain_traits::constants::KEY_ROTATION_COOLDOWN_BLOCKS);
+
+            self.pending_admin_rotation = Some(propchain_traits::KeyRotationRequest {
+                old_account: caller,
+                new_account: new_admin,
+                requested_at: block,
+                effective_at,
+                confirmed: false,
+            });
+
+            self.env().emit_event(AdminRotationRequested {
+                old_admin: caller,
+                new_admin,
+                effective_at_block: effective_at,
+            });
+            Ok(())
+        }
+
+        /// Confirm a pending admin rotation after the cooldown period.
+        ///
+        /// Must be called by the nominated new admin.
+        #[ink(message)]
+        pub fn confirm_admin_rotation(&mut self) -> Result<(), AnalyticsError> {
+            let caller = self.env().caller();
+            let block = self.env().block_number();
+
+            let request = self
+                .pending_admin_rotation
+                .as_ref()
+                .ok_or(AnalyticsError::NoPendingRotation)?;
+
+            if request.new_account != caller {
+                return Err(AnalyticsError::RotationUnauthorized);
+            }
+            if block < request.effective_at {
+                return Err(AnalyticsError::KeyRotationCooldown);
+            }
+            let expiry = request
+                .effective_at
+                .saturating_add(propchain_traits::constants::KEY_ROTATION_EXPIRY_BLOCKS);
+            if block > expiry {
+                self.pending_admin_rotation = None;
+                return Err(AnalyticsError::RequestExpired);
+            }
+
+            let old_admin = request.old_account;
+            self.admin = caller;
+            self.pending_admin_rotation = None;
+
+            self.env().emit_event(AdminRotationConfirmed {
+                old_admin,
+                new_admin: caller,
+            });
+            Ok(())
+        }
+
+        /// Cancel a pending admin rotation.
+        ///
+        /// Either the current admin or the nominated new admin may cancel.
+        #[ink(message)]
+        pub fn cancel_admin_rotation(&mut self) -> Result<(), AnalyticsError> {
+            let caller = self.env().caller();
+            let request = self
+                .pending_admin_rotation
+                .as_ref()
+                .ok_or(AnalyticsError::NoPendingRotation)?;
+
+            if caller != request.old_account && caller != request.new_account {
+                return Err(AnalyticsError::RotationUnauthorized);
+            }
+
+            let old_admin = request.old_account;
+            self.pending_admin_rotation = None;
+
+            self.env().emit_event(AdminRotationCancelled {
+                old_admin,
+                cancelled_by: caller,
+            });
+            Ok(())
+        }
+
+        /// Get the pending admin rotation request, if any.
+        #[ink(message)]
+        pub fn get_pending_admin_rotation(
+            &self,
+        ) -> Option<propchain_traits::KeyRotationRequest> {
+            self.pending_admin_rotation.clone()
         }
     }
 
@@ -296,5 +453,83 @@ mod propchain_analytics {
             assert_eq!(report.sentiment.bull_bear_ratio_bips, 5000);
             assert!(report.insights.contains("Gas optimization"));
         }
+    }
+}
+
+// =========================================================================
+// ADMIN KEY ROTATION TESTS (Issue #496) — Analytics
+// =========================================================================
+
+#[cfg(test)]
+mod analytics_admin_rotation_tests {
+    use super::propchain_analytics::{AnalyticsDashboard, AnalyticsError};
+    use ink::env::{test, DefaultEnvironment};
+
+    fn setup() -> AnalyticsDashboard {
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        AnalyticsDashboard::new()
+    }
+
+    #[ink::test]
+    fn test_admin_can_request_rotation() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        assert!(contract.request_admin_rotation(accounts.bob).is_ok());
+        let pending = contract.get_pending_admin_rotation();
+        assert!(pending.is_some());
+        let req = pending.unwrap();
+        assert_eq!(req.old_account, accounts.alice);
+        assert_eq!(req.new_account, accounts.bob);
+    }
+
+    #[ink::test]
+    fn test_non_admin_cannot_request_rotation() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        assert_eq!(
+            contract.request_admin_rotation(accounts.charlie),
+            Err(AnalyticsError::Unauthorized)
+        );
+    }
+
+    #[ink::test]
+    fn test_rotation_cannot_be_confirmed_before_cooldown() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        contract.request_admin_rotation(accounts.bob).unwrap();
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        assert_eq!(
+            contract.confirm_admin_rotation(),
+            Err(AnalyticsError::KeyRotationCooldown)
+        );
+    }
+
+    #[ink::test]
+    fn test_old_or_new_admin_can_cancel_rotation() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        // Old admin cancels
+        contract.request_admin_rotation(accounts.bob).unwrap();
+        assert!(contract.cancel_admin_rotation().is_ok());
+        assert!(contract.get_pending_admin_rotation().is_none());
+
+        // New admin cancels
+        contract.request_admin_rotation(accounts.bob).unwrap();
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        assert!(contract.cancel_admin_rotation().is_ok());
+    }
+
+    #[ink::test]
+    fn test_unrelated_cannot_cancel() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        contract.request_admin_rotation(accounts.bob).unwrap();
+        test::set_caller::<DefaultEnvironment>(accounts.charlie);
+        assert_eq!(
+            contract.cancel_admin_rotation(),
+            Err(AnalyticsError::RotationUnauthorized)
+        );
     }
 }
