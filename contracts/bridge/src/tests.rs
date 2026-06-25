@@ -209,6 +209,170 @@ mod tests {
     }
 
     #[ink::test]
+    fn test_batch_verification_configuration() {
+        let mut bridge = setup_bridge();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+
+        // Get default configuration
+        let (window_size, window_duration) = bridge.get_batch_config();
+        assert_eq!(window_size, 10);
+        assert_eq!(window_duration, 300);
+
+        // Update configuration
+        bridge
+            .configure_batch_verification(20, 600)
+            .expect("configure batch verification");
+
+        let (new_window_size, new_window_duration) = bridge.get_batch_config();
+        assert_eq!(new_window_size, 20);
+        assert_eq!(new_window_duration, 600);
+    }
+
+    #[ink::test]
+    fn test_batch_verification_window_creation() {
+        let mut bridge = setup_bridge();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+
+        // Add validator and operator for bridge execution
+        bridge
+            .add_validator(accounts.alice)
+            .expect("add validator");
+        bridge
+            .add_validator(accounts.bob)
+            .expect("add validator");
+
+        // Execute a bridge transaction to create a batch window
+        let metadata = PropertyMetadata {
+            location: String::from("Test Property"),
+            size: 1000,
+            legal_description: String::from("Test"),
+            valuation: 100000,
+            documents_url: String::from("ipfs://test"),
+        };
+
+        let request_id = bridge
+            .initiate_bridge_multisig(1, 2, accounts.bob, 2, Some(50), metadata)
+            .expect("initiate bridge");
+
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        bridge
+            .sign_bridge_request(request_id, true)
+            .expect("sign");
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        bridge
+            .sign_bridge_request(request_id, true)
+            .expect("sign");
+
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        bridge
+            .execute_bridge(request_id)
+            .expect("execute bridge");
+
+        // Get transaction hash from bridge history
+        let history = bridge.get_bridge_history(accounts.alice);
+        assert!(!history.is_empty());
+        let transaction_hash = history[0].transaction_hash;
+
+        // Check that transaction is in a batch
+        let batch_info = bridge.get_transaction_batch(transaction_hash);
+        assert!(batch_info.is_some());
+        let (source_chain, window_id) = batch_info.unwrap();
+        assert_eq!(source_chain, 1); // Default source chain
+    }
+
+    #[ink::test]
+    fn test_batch_merkle_root_submission_and_verification() {
+        let mut bridge = setup_bridge();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+
+        // Add validator and operator
+        bridge
+            .add_validator(accounts.alice)
+            .expect("add validator");
+        bridge
+            .add_validator(accounts.bob)
+            .expect("add validator");
+
+        // Execute a bridge transaction
+        let metadata = PropertyMetadata {
+            location: String::from("Test Property"),
+            size: 1000,
+            legal_description: String::from("Test"),
+            valuation: 100000,
+            documents_url: String::from("ipfs://test"),
+        };
+
+        let request_id = bridge
+            .initiate_bridge_multisig(1, 2, accounts.bob, 2, Some(50), metadata)
+            .expect("initiate bridge");
+
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        bridge
+            .sign_bridge_request(request_id, true)
+            .expect("sign");
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        bridge
+            .sign_bridge_request(request_id, true)
+            .expect("sign");
+
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        bridge
+            .execute_bridge(request_id)
+            .expect("execute bridge");
+
+        // Get transaction hash and batch info
+        let history = bridge.get_bridge_history(accounts.alice);
+        let transaction_hash = history[0].transaction_hash;
+        let batch_info = bridge.get_transaction_batch(transaction_hash).unwrap();
+
+        // Submit batch Merkle root
+        let merkle_root = Hash::from([1u8; 32]);
+        bridge
+            .submit_batch_merkle_root(batch_info.0, batch_info.1, merkle_root)
+            .expect("submit batch merkle root");
+
+        // Verify batch Merkle root
+        bridge
+            .verify_batch_merkle_root(batch_info.0, batch_info.1, merkle_root)
+            .expect("verify batch merkle root");
+
+        // Check that transaction is now verified
+        assert!(bridge.verify_bridge_transaction(transaction_hash, batch_info.0));
+
+        // Get batch window信息
+        let window_info = bridge.get_batch_window_info(batch_info.0, batch_info.1);
+        assert!(window_info.is_some());
+        let (stored_root, transactions) = window_info.unwrap();
+        assert_eq!(stored_root, merkle_root);
+        assert!(transactions.contains(&transaction_hash));
+    }
+
+    #[ink::test]
+    fn test_batch_verification_unauthorized() {
+        let mut bridge = setup_bridge();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+
+        // Try to configure batch verification as non-admin
+        let result = bridge.configure_batch_verification(20, 600);
+        assert!(result.is_err());
+
+        // Try to submit batch Merkle root as non-admin/non-operator
+        let merkle_root = Hash::from([1u8; 32]);
+        let result = bridge.submit_batch_merkle_root(1, 1, merkle_root);
+        assert!(result.is_err());
+
+        // Try to verify batch Merkle root as non-admin/non-operator
+        let result = bridge.verify_batch_merkle_root(1, 1, merkle_root);
+        assert!(result.is_err());
+    }
+
+    #[ink::test]
     fn test_initiate_multi_hop_bridge_two_hops() {
         let mut bridge = setup_bridge();
         let accounts = test::default_accounts::<DefaultEnvironment>();
