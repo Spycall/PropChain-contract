@@ -1,11 +1,24 @@
 // Dynamic premium calculation engine based on risk assessment
 // Implements actuarial pricing with real-time adjustments
+// Claim-frequency adjustment added (rolling-window surcharge)
 
-use crate::{
-    ActuarialModel, CoverageType, PremiumCalculation, PremiumModifiers, RiskAssessment, RiskPool,
-};
 
-/// Dynamic premium calculation with comprehensive risk factors
+
+/// Dynamic premium calculation with comprehensive risk factors.
+///
+/// Steps:
+///  1. Base rate (actuarial model or coverage-type default)
+///  2. Risk multiplier (weighted location / construction / age / claims-history scores)
+///  3. Coverage-type multiplier
+///  4. Pool-utilization multiplier
+///  5. Time-based multiplier
+///  6. Discount multiplier (multi-policy, claim-free, safety, loyalty)
+///  7. **Claim-frequency multiplier** (rolling-window surcharge — new)
+///
+/// The claim-frequency step uses `modifiers.recent_claims_count`, which the
+/// caller populates with the number of approved claims filed against the
+/// property within the rolling observation window (default: 12 months).
+/// Defaults match the table in `DYNAMIC_PREMIUM_CALCULATION.md`.
 pub fn calculate_dynamic_premium(
     risk_assessment: &RiskAssessment,
     coverage_amount: u128,
@@ -33,8 +46,13 @@ pub fn calculate_dynamic_premium(
     // Step 6: Calculate discounts
     let discount_multiplier = calculate_discount_multiplier(modifiers);
 
-    // Step 7: Calculate final premium
-    // Formula: coverage * base_rate * risk_mult * coverage_mult * pool_mult * time_mult * discount_mult
+    // Step 7: Rolling-window claim-frequency surcharge
+    // recent_claims_count = number of approved claims in the observation window
+    let claim_freq_multiplier =
+        calculate_claim_frequency_multiplier(modifiers.recent_claims_count);
+
+    // Formula: coverage × base_rate × risk × coverage × pool × time × discount × claim_freq
+    // All multipliers are in basis points (10 000 = 1.0×), divisor accounts for all 7 factors.
     let annual_premium = coverage_amount
         .saturating_mul(base_rate as u128)
         .saturating_mul(risk_multiplier as u128)
@@ -42,12 +60,12 @@ pub fn calculate_dynamic_premium(
         .saturating_mul(pool_utilization_multiplier as u128)
         .saturating_mul(time_multiplier as u128)
         .saturating_mul(discount_multiplier as u128)
+        .saturating_mul(claim_freq_multiplier as u128)
         / PREMIUM_CALCULATION_DIVISOR;
 
     // Prorate for policy duration
-    let duration_premium = annual_premium
-        .saturating_mul(policy_duration_seconds as u128)
-        / SECONDS_PER_YEAR;
+    let duration_premium =
+        annual_premium.saturating_mul(policy_duration_seconds as u128) / SECONDS_PER_YEAR;
 
     let monthly_premium = duration_premium / 12;
 
@@ -61,11 +79,13 @@ pub fn calculate_dynamic_premium(
         pool_utilization_multiplier,
         time_multiplier,
         discount_multiplier,
+        claim_freq_multiplier,
         annual_premium: duration_premium,
         monthly_premium,
         deductible,
         breakdown: PremiumBreakdown {
-            base_premium: coverage_amount.saturating_mul(base_rate as u128) / BASIS_POINTS_DENOMINATOR,
+            base_premium: coverage_amount.saturating_mul(base_rate as u128)
+                / BASIS_POINTS_DENOMINATOR,
             risk_adjustment: calculate_risk_adjustment_amount(
                 coverage_amount,
                 base_rate,
@@ -101,18 +121,31 @@ pub fn calculate_dynamic_premium(
                 time_multiplier,
                 discount_multiplier,
             ),
+            claim_freq_adjustment: calculate_claim_freq_adjustment_amount(
+                coverage_amount,
+                base_rate,
+                risk_multiplier,
+                coverage_multiplier,
+                pool_utilization_multiplier,
+                time_multiplier,
+                discount_multiplier,
+                claim_freq_multiplier,
+            ),
         },
     }
 }
 
 /// Calculate base rate from actuarial model
-fn calculate_base_rate(actuarial_model: Option<&ActuarialModel>, coverage_type: &CoverageType) -> u32 {
+fn calculate_base_rate(
+    actuarial_model: Option<&ActuarialModel>,
+    coverage_type: &CoverageType,
+) -> u32 {
     match actuarial_model {
         Some(model) => {
             // Use actuarial model: expected_loss_ratio * confidence_adjustment
             // Expected loss ratio in basis points (e.g., 600 = 6%)
             let expected_loss = model.expected_loss_ratio;
-            
+
             // Confidence level adjustment (95% = 1.0, 99% = 1.2)
             let confidence_adjustment = match model.confidence_level {
                 95 => 100,
@@ -125,7 +158,7 @@ fn calculate_base_rate(actuarial_model: Option<&ActuarialModel>, coverage_type: 
 
             // Base rate = expected_loss * confidence_adjustment / 100
             let model_rate = expected_loss.saturating_mul(confidence_adjustment as u32) / 100;
-            
+
             // Add expense loading (20% for operational costs)
             model_rate.saturating_mul(120) / 100
         }
@@ -139,13 +172,13 @@ fn calculate_base_rate(actuarial_model: Option<&ActuarialModel>, coverage_type: 
 /// Default base rates by coverage type
 fn coverage_type_base_rate(coverage_type: &CoverageType) -> u32 {
     match coverage_type {
-        CoverageType::Fire => 120,          // 1.2%
-        CoverageType::Flood => 200,         // 2.0%
-        CoverageType::Earthquake => 250,    // 2.5%
-        CoverageType::Theft => 100,         // 1.0%
+        CoverageType::Fire => 120,            // 1.2%
+        CoverageType::Flood => 200,           // 2.0%
+        CoverageType::Earthquake => 250,      // 2.5%
+        CoverageType::Theft => 100,           // 1.0%
         CoverageType::LiabilityDamage => 150, // 1.5%
         CoverageType::NaturalDisaster => 220, // 2.2%
-        CoverageType::Comprehensive => 300,  // 3.0%
+        CoverageType::Comprehensive => 300,   // 3.0%
     }
 }
 
@@ -164,16 +197,16 @@ fn calculate_risk_multiplier(assessment: &RiskAssessment) -> u32 {
     // Convert score (0-100) to multiplier (50-400 basis points)
     // Score 0 = very high risk (4.0x), Score 100 = very low risk (0.5x)
     match weighted_score {
-        0..=10 => 400,    // Very high risk
-        11..=20 => 350,   // High risk
-        21..=30 => 300,   // High-medium risk
-        31..=40 => 250,   // Medium-high risk
-        41..=50 => 200,   // Medium risk
-        51..=60 => 170,   // Medium-low risk
-        61..=70 => 140,   // Low-medium risk
-        71..=80 => 110,   // Low risk
-        81..=90 => 85,    // Very low risk
-        _ => 60,          // Minimal risk
+        0..=10 => 400,  // Very high risk
+        11..=20 => 350, // High risk
+        21..=30 => 300, // High-medium risk
+        31..=40 => 250, // Medium-high risk
+        41..=50 => 200, // Medium risk
+        51..=60 => 170, // Medium-low risk
+        61..=70 => 140, // Low-medium risk
+        71..=80 => 110, // Low risk
+        81..=90 => 85,  // Very low risk
+        _ => 60,        // Minimal risk
     }
 }
 
@@ -203,11 +236,11 @@ fn calculate_pool_utilization_multiplier(pool: &RiskPool) -> u32 {
 
     // Adjust multiplier based on utilization
     match utilization_rate {
-        0..=30 => 90,    // Low utilization - discount
-        31..=50 => 100,  // Normal utilization
-        51..=70 => 115,  // Medium-high utilization - slight increase
-        71..=85 => 135,  // High utilization - significant increase
-        _ => 160,        // Critical utilization - major increase
+        0..=30 => 90,   // Low utilization - discount
+        31..=50 => 100, // Normal utilization
+        51..=70 => 115, // Medium-high utilization - slight increase
+        71..=85 => 135, // High utilization - significant increase
+        _ => 160,       // Critical utilization - major increase
     }
 }
 
@@ -215,11 +248,35 @@ fn calculate_pool_utilization_multiplier(pool: &RiskPool) -> u32 {
 /// Longer policies get slight discounts for stability
 fn calculate_time_multiplier(duration_seconds: u64) -> u32 {
     match duration_seconds {
-        0..=2_592_000 => 105,    // < 30 days - short term premium
+        0..=2_592_000 => 105,          // < 30 days - short term premium
         2_592_001..=7_776_000 => 100,  // 1-3 months - standard
         7_776_001..=15_552_000 => 95,  // 3-6 months - slight discount
         15_552_001..=31_536_000 => 90, // 6-12 months - good discount
         _ => 85,                       // > 1 year - best discount
+    }
+}
+
+/// Rolling-window claim-frequency surcharge multiplier.
+///
+/// Uses the number of approved claims filed within the rolling observation
+/// window (typically 12 months) stored in `PremiumModifiers::recent_claims_count`.
+///
+/// | Claims in window | Multiplier | Basis points |
+/// |-----------------|------------|-------------|
+/// | 0               | 1.00×      | 10 000       | (no surcharge — baseline)
+/// | 1               | 1.10×      | 11 000       |
+/// | 2               | 1.25×      | 12 500       |
+/// | 3               | 1.50×      | 15 000       |
+/// | 4               | 1.75×      | 17 500       |
+/// | 5+              | 2.00×      | 20 000       | (high-frequency cap)
+fn calculate_claim_frequency_multiplier(recent_claims_count: u32) -> u32 {
+    match recent_claims_count {
+        0 => 10_000,  // 1.00× — no surcharge
+        1 => 11_000,  // 1.10×
+        2 => 12_500,  // 1.25×
+        3 => 15_000,  // 1.50×
+        4 => 17_500,  // 1.75×
+        _ => 20_000,  // 2.00× — high-frequency cap (5+ claims)
     }
 }
 
@@ -235,10 +292,10 @@ fn calculate_discount_multiplier(modifiers: &PremiumModifiers) -> u32 {
     // Claim-free discount (up to 20% based on years)
     if modifiers.claim_free_years > 0 {
         let claim_free_discount = match modifiers.claim_free_years {
-            1 => 500,    // 5%
-            2 => 1000,   // 10%
-            3 => 1500,   // 15%
-            _ => 2000,   // 20% for 4+ years
+            1 => 500,  // 5%
+            2 => 1000, // 10%
+            3 => 1500, // 15%
+            _ => 2000, // 20% for 4+ years
         };
         total_discount_bps = total_discount_bps.saturating_add(claim_free_discount);
     }
@@ -251,9 +308,9 @@ fn calculate_discount_multiplier(modifiers: &PremiumModifiers) -> u32 {
     // Loyalty discount (up to 10%)
     if modifiers.loyalty_years > 0 {
         let loyalty_discount = match modifiers.loyalty_years {
-            1..=2 => 300,    // 3%
-            3..=5 => 600,    // 6%
-            _ => 1000,       // 10% for 6+ years
+            1..=2 => 300, // 3%
+            3..=5 => 600, // 6%
+            _ => 1000,    // 10% for 6+ years
         };
         total_discount_bps = total_discount_bps.saturating_add(loyalty_discount);
     }
@@ -278,11 +335,11 @@ fn calculate_deductible(
 
     // Adjust based on risk (higher risk = higher deductible)
     let risk_adjustment: u32 = match assessment.overall_risk_score {
-        0..=20 => 200,     // Very high risk - 20% deductible
-        21..=40 => 150,    // High risk - 15%
-        41..=60 => 100,    // Medium risk - 10%
-        61..=80 => 75,     // Low risk - 7.5%
-        _ => 50,           // Very low risk - 5%
+        0..=20 => 200,  // Very high risk - 20% deductible
+        21..=40 => 150, // High risk - 15%
+        41..=60 => 100, // Medium risk - 10%
+        61..=80 => 75,  // Low risk - 7.5%
+        _ => 50,        // Very low risk - 5%
     };
 
     let deductible_rate = base_deductible_rate.saturating_add(risk_adjustment);
@@ -299,13 +356,10 @@ fn calculate_deductible(
 }
 
 /// Calculate risk adjustment amount for breakdown
-fn calculate_risk_adjustment_amount(
-    coverage: u128,
-    base_rate: u32,
-    risk_multiplier: u32,
-) -> u128 {
+fn calculate_risk_adjustment_amount(coverage: u128, base_rate: u32, risk_multiplier: u32) -> u128 {
     let base_premium = coverage.saturating_mul(base_rate as u128) / BASIS_POINTS_DENOMINATOR;
-    let risk_adjusted = base_premium.saturating_mul(risk_multiplier as u128) / BASIS_POINTS_DENOMINATOR;
+    let risk_adjusted =
+        base_premium.saturating_mul(risk_multiplier as u128) / BASIS_POINTS_DENOMINATOR;
     risk_adjusted.saturating_sub(base_premium)
 }
 
@@ -321,9 +375,8 @@ fn calculate_coverage_adjustment_amount(
         .saturating_mul(risk_multiplier as u128)
         / PREMIUM_CALCULATION_DIVISOR;
 
-    let premium_after = premium_before
-        .saturating_mul(coverage_multiplier as u128)
-        / BASIS_POINTS_DENOMINATOR;
+    let premium_after =
+        premium_before.saturating_mul(coverage_multiplier as u128) / BASIS_POINTS_DENOMINATOR;
 
     premium_after.saturating_sub(premium_before)
 }
@@ -342,9 +395,8 @@ fn calculate_pool_adjustment_amount(
         .saturating_mul(coverage_multiplier as u128)
         / PREMIUM_CALCULATION_DIVISOR;
 
-    let premium_after = premium_before
-        .saturating_mul(pool_multiplier as u128)
-        / BASIS_POINTS_DENOMINATOR;
+    let premium_after =
+        premium_before.saturating_mul(pool_multiplier as u128) / BASIS_POINTS_DENOMINATOR;
 
     premium_after.saturating_sub(premium_before)
 }
@@ -365,9 +417,8 @@ fn calculate_time_adjustment_amount(
         .saturating_mul(pool_multiplier as u128)
         / PREMIUM_CALCULATION_DIVISOR_LARGE;
 
-    let premium_after = premium_before
-        .saturating_mul(time_multiplier as u128)
-        / BASIS_POINTS_DENOMINATOR;
+    let premium_after =
+        premium_before.saturating_mul(time_multiplier as u128) / BASIS_POINTS_DENOMINATOR;
 
     premium_after.saturating_sub(premium_before)
 }
@@ -390,16 +441,50 @@ fn calculate_discount_amount(
         .saturating_mul(time_multiplier as u128)
         / PREMIUM_CALCULATION_DIVISOR_5MULT;
 
-    let final_premium = premium_before_discount
-        .saturating_mul(discount_multiplier as u128)
+    let final_premium = premium_before_discount.saturating_mul(discount_multiplier as u128)
         / BASIS_POINTS_DENOMINATOR;
 
     premium_before_discount.saturating_sub(final_premium)
 }
 
+/// Calculate the claim-frequency surcharge amount for the breakdown.
+///
+/// This is the additional cost the claim-frequency multiplier adds on top of
+/// the already-discounted premium (i.e. it is always additive / non-negative).
+fn calculate_claim_freq_adjustment_amount(
+    coverage: u128,
+    base_rate: u32,
+    risk_multiplier: u32,
+    coverage_multiplier: u32,
+    pool_multiplier: u32,
+    time_multiplier: u32,
+    discount_multiplier: u32,
+    claim_freq_multiplier: u32,
+) -> u128 {
+    // Premium after discount, before claim-frequency step
+    let pre_freq = coverage
+        .saturating_mul(base_rate as u128)
+        .saturating_mul(risk_multiplier as u128)
+        .saturating_mul(coverage_multiplier as u128)
+        .saturating_mul(pool_multiplier as u128)
+        .saturating_mul(time_multiplier as u128)
+        .saturating_mul(discount_multiplier as u128)
+        / PREMIUM_CALCULATION_DIVISOR;
+
+    let post_freq = pre_freq
+        .saturating_mul(claim_freq_multiplier as u128)
+        / BASIS_POINTS_DENOMINATOR;
+
+    post_freq.saturating_sub(pre_freq)
+}
+
 // Constants
 const BASIS_POINTS_DENOMINATOR: u128 = 10_000;
 const SECONDS_PER_YEAR: u128 = 31_536_000; // 365 * 24 * 60 * 60
-const PREMIUM_CALCULATION_DIVISOR: u128 = 1_000_000_000_000_000_000; // 10^18 for 5 multipliers
-const PREMIUM_CALCULATION_DIVISOR_LARGE: u128 = 10_000_000_000_000_000_000_000; // 10^22 for 6 multipliers
-const PREMIUM_CALCULATION_DIVISOR_5MULT: u128 = 1_000_000_000_000_000_000_000; // 10^21 for discount calc
+/// Divisor for the 7-factor chain: base_rate × risk × coverage × pool × time × discount × claim_freq
+/// All 7 multipliers are in basis points (10 000 = 1.0×), so each divides by 10 000.
+/// 10 000^6 = 10^24; but base_rate uses a different scale (it's in raw basis points ÷ 10 000 once),
+/// so the combined divisor keeps the same structure as before with an extra ×10 000 for claim_freq.
+const PREMIUM_CALCULATION_DIVISOR: u128 = 10_000_000_000_000_000_000_000_000; // 10^25 for 7 factors
+const PREMIUM_CALCULATION_DIVISOR_LARGE: u128 = 10_000_000_000_000_000_000_000; // 10^22 for 6 multipliers (breakdown helpers)
+const PREMIUM_CALCULATION_DIVISOR_5MULT: u128 = 1_000_000_000_000_000_000_000; // 10^21 for discount calc (5 factors before discount)
