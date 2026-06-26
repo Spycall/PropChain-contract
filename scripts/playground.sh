@@ -103,7 +103,7 @@ Description:
     4) Vote on Proposal          (governance :: vote)
     5) Create Insurance Policy   (insurance :: create_policy)
     6) Show resolved contract addresses
-    0) Exit
+    0) Exit & Export Scenario Script
 
 Environment variables:
   NETWORK   Target network: local | westend | rococo | polkadot (default: local)
@@ -255,7 +255,7 @@ show_addresses() {
         local f="$DEPLOYMENTS_DIR/$dir.json"
         if [[ -f "$f" ]]; then
             echo "  $dir: $(jq -r '.address' "$f")"
-        | else
+        else
             echo "  $dir: (not deployed on $NETWORK)"
         fi
     done
@@ -268,38 +268,66 @@ generate_playground_scenario() {
     section "Compiling Playground Scenario Metadata File"
     
     if [ ! -s "$INTERACTION_LOG_TMP" ]; then
-        log_warning "No runtime interaction traces were captured during this playground session. Skipping scenario export."
+        log_warning "No runtime interaction traces were captured during this session. Skipping scenario export."
         return 0
     fi
 
-    log_info "Extracting trace execution matrices..."
+    log_info "Extracting and structuring execution matrix profiles..."
 
-    # Isolate cross-contract invocations and event elements
-    local contract_calls
-    local emitted_events
-    contract_calls=$(grep -E "invoking|called contract|Calling" "$INTERACTION_LOG_TMP" || echo "[]")
-    emitted_events=$(grep -E "event|emitted|Event" "$INTERACTION_LOG_TMP" || echo "[]")
+    # Extract distinct invocations, contract calls, and events using safe stream capturing
+    local raw_calls
+    local raw_events
+    
+    raw_calls=$(grep -E "^--- Call Step:" "$INTERACTION_LOG_TMP" | sed 's/--- Call Step: //g' | sed 's/ ---//g' || echo "")
+    raw_events=$(grep -E "^\s*Event\s" "$INTERACTION_LOG_TMP" | sed -e 's/^[[:space:]]*//' || echo "")
 
-    log_info "Writing playground configuration to: $OUTPUT_SCENARIO"
-
-    cat << EOF > "$OUTPUT_SCENARIO"
+    # Clean historical entries and build self-contained runtime snapshot block
+    local json_payload
+    json_payload=$(jq -n \
+        --arg network "$NETWORK" \
+        --arg suri "$SURI" \
+        --arg ts "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+        --arg calls_str "$raw_calls" \
+        --arg events_str "$raw_events" \
+        '{
+            "meta": {
+                "generator": "scripts/playground.sh",
+                "compiledAt": $ts,
+                "compatibilityMode": "IDE-Playground-Engine/v2"
+            },
+            "environment": {
+                "targetNetwork": $network,
+                "signerIdentity": ($suri | shadow_suri)
+            },
+            "traceData": {
+                "executedCalls": ($calls_str | split("\n") | map(select(length > 0))),
+                "emittedEvents": ($events_str | split("\n") | map(select(length > 0)))
+            }
+        }' \
+        --args --import-vars 2>/dev/null || \
+        # Fallback inline string assembly block if jq internal filters throw parsing constraints
+        cat << EOF
 {
   "meta": {
     "generator": "scripts/playground.sh",
-    "timestamp": "$(date -u)",
-    "targetEnvironment": "PropChain Interactive Engine Stack"
+    "compiledAt": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+    "compatibilityMode": "IDE-Playground-Engine/v2"
   },
-  "scenarioState": {
-    "network": "$NETWORK",
-    "signingUri": "$SURI",
-    "capturedTraces": {
-      "calls": $(echo "$contract_calls" | jq -R -s -c 'split("\n") | map(select(length > 0))' || echo "[]"),
-      "events": $(echo "$emitted_events" | jq -R -s -c 'split("\n") | map(select(length > 0))' || echo "[]")
-    }
+  "environment": {
+    "targetNetwork": "$NETWORK",
+    "signerIdentity": "MASKED_SESSION_KEY"
+  },
+  "traceData": {
+    "executedCalls": $(echo "$raw_calls" | jq -R -s -c 'split("\n") | map(select(length > 0))'),
+    "emittedEvents": $(echo "$raw_events" | jq -R -s -c 'split("\n") | map(select(length > 0))')
   }
 }
 EOF
-    log_success "Scenario generation complete. Compatible with docs/playground.html."
+    )
+
+    echo "$json_payload" | jq '.' > "$OUTPUT_SCENARIO"
+    log_success "Scenario file emitted successfully -> $OUTPUT_SCENARIO"
+    log_info "Compatible for playback rendering inside docs/playground.html."
 }
 
 # ---------------------------------------------------------------------------
@@ -334,7 +362,8 @@ run_call() {
     set -e
 
     echo "$output"
-    # Append to runtime trace log for downstream #652 generation logic
+    
+    # Commit output block streams into runtime telemetry buffer for scenario parsing
     echo "--- Call Step: $message on $contract_dir ($address) ---" >> "$INTERACTION_LOG_TMP"
     echo "$output" >> "$INTERACTION_LOG_TMP"
 
@@ -476,7 +505,7 @@ main() {
         echo "  4) Vote on Proposal"
         echo "  5) Create Insurance Policy"
         echo "  6) Show resolved contract addresses"
-        echo "  0) Exit & Export Scenario"
+        echo "  0) Exit & Export Scenario Script"
         echo
         local choice
         read -r -p "Select an option: " choice
@@ -489,7 +518,7 @@ main() {
             5) action_create_insurance_policy ;;
             6) show_addresses ;;
             0) 
-                log_info "Terminating session loop..."
+                log_info "Compiling execution logs and building deployment scenario..."
                 generate_playground_scenario
                 rm -f "$INTERACTION_LOG_TMP"
                 log_info "Bye!"
