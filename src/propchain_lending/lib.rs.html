@@ -363,7 +363,7 @@
 <a href=#363 id=363 data-nosnippet>363</a>                    <span class="kw">if </span>n == <span class="number">0 </span>{
 <a href=#364 id=364 data-nosnippet>364</a>                        <span class="kw">return </span>principal;
 <a href=#365 id=365 data-nosnippet>365</a>                    }
-<a href=#366 id=366 data-nosnippet>366</a>                    <span class="kw">let </span>per_period_rate_numer = (rate_bps <span class="kw">as </span>u128).saturating_mul(interval_blocks);
+<a href=#366 id=366 data-nosnippet>366</a>                    <span class="kw">let </span>per_period_rate_numer = (rate_bps <span class="kw">as </span>u128).saturating_mul(interval_blocks <span class="kw">as </span>u128);
 <a href=#367 id=367 data-nosnippet>367</a>                    <span class="kw">let </span>per_period_rate_denom = <span class="number">52_560_000_000u128</span>; <span class="comment">// 5_256_000 * 10_000
 <a href=#368 id=368 data-nosnippet>368</a>                    </span><span class="kw">let </span>interest = principal
 <a href=#369 id=369 data-nosnippet>369</a>                        .saturating_mul(per_period_rate_numer)
@@ -381,7 +381,7 @@
 <a href=#381 id=381 data-nosnippet>381</a>                    }
 <a href=#382 id=382 data-nosnippet>382</a>                    <span class="comment">// Equal principal + declining interest
 <a href=#383 id=383 data-nosnippet>383</a>                    </span><span class="kw">let </span>per_period_principal = principal / n;
-<a href=#384 id=384 data-nosnippet>384</a>                    <span class="kw">let </span>per_period_rate_numer = (rate_bps <span class="kw">as </span>u128).saturating_mul(interval_blocks);
+<a href=#384 id=384 data-nosnippet>384</a>                    <span class="kw">let </span>per_period_rate_numer = (rate_bps <span class="kw">as </span>u128).saturating_mul(interval_blocks <span class="kw">as </span>u128);
 <a href=#385 id=385 data-nosnippet>385</a>                    <span class="kw">let </span>per_period_rate_denom = <span class="number">52_560_000_000u128</span>; <span class="comment">// 5_256_000 * 10_000
 <a href=#386 id=386 data-nosnippet>386</a>                    </span><span class="kw">let </span>interest_first = principal
 <a href=#387 id=387 data-nosnippet>387</a>                        .saturating_mul(per_period_rate_numer)
